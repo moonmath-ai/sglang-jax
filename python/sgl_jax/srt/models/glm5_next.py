@@ -286,12 +286,14 @@ class Glm5NextDecoderLayer(nnx.Module):
                 h = self.input_layernorm(hidden_states)
 
         if self.is_kda:
-            attn_out, attn_state = self.self_attn(positions, h, forward_batch, recurrent_state_pool)
+            with jax.named_scope("glm53_kda_attn"):
+                attn_out, attn_state = self.self_attn(positions, h, forward_batch, recurrent_state_pool)
         else:
-            attn_out, attn_state = self.self_attn(
-                positions, h, forward_batch, token_to_kv_pool,
-                dsa_topk_in=dsa_topk_in, dsa_topk_pages_in=dsa_topk_pages_in,
-            )
+            with jax.named_scope("glm53_dsa_attn"):
+                attn_out, attn_state = self.self_attn(
+                    positions, h, forward_batch, token_to_kv_pool,
+                    dsa_topk_in=dsa_topk_in, dsa_topk_pages_in=dsa_topk_pages_in,
+                )
 
         if use_mhc:
             hidden_states = self.hc_attn.post(attn_out, hc_state, hidden_states)
@@ -304,13 +306,14 @@ class Glm5NextDecoderLayer(nnx.Module):
 
         # ---- MLP sublayer ----
         if self.is_moe_layer:
-            shared_output = self.shared_experts(h) if self.shared_experts is not None else None
-            router_logits = self.moe_gate(h)
-            correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
-            topk_weights, topk_ids = self.topk(router_logits, correction_bias, dispatch_info=dispatch_info)
-            mlp_out = self.mlp(h, topk_weights, topk_ids)
-            if shared_output is not None:
-                mlp_out = mlp_out + shared_output
+            with jax.named_scope("glm53_moe"):
+                shared_output = self.shared_experts(h) if self.shared_experts is not None else None
+                router_logits = self.moe_gate(h)
+                correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
+                topk_weights, topk_ids = self.topk(router_logits, correction_bias, dispatch_info=dispatch_info)
+                mlp_out = self.mlp(h, topk_weights, topk_ids)
+                if shared_output is not None:
+                    mlp_out = mlp_out + shared_output
         else:
             mlp_out = self.mlp(h)
             topk_ids = None
