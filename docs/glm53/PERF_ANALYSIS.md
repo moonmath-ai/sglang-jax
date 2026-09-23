@@ -1,31 +1,38 @@
-# GLM-5.3-Flash TPU v7 decode cost decomposition (real FP8 weights)
 
-## Method
-End-to-end decode tok/s vs context length (trustworthy; standalone kernel benches overstate
-per-layer cost because they include host dispatch not present in the fused jitted loop).
-Fit: `step_ms = 18.7 + 1.345 * (ctx/1000)`.
+# GLM-5.3-Flash TPU v7 decode bottleneck analysis (measured)
 
-| ctx | step ms |
-|---|---|
-| 17 | 18.3 |
-| 513 | 19.1 |
-| 2049 | 22.7 |
-| 8193 | 29.0 |
-| 16385 | 41.0 |
+## Reliable decode decomposition (end-to-end, real weights)
+`step_ms = 18.7 (fixed) + 1.345 * ctx/1000`
+- Fixed 18.7 ms/step (53 tok/s ceiling): 45-layer forward.
+- Context term 1.35 ms/1k: MLA sparse attention.
 
-## Decomposition
-- **Fixed per-step: 18.7 ms** (53 tok/s ceiling) = 45-layer forward (matmul + MoE + mHC + launches).
-  **DOMINANT at short/medium context.** Not addressed by KV/caching work.
-- **Context-proportional: 1.345 ms per 1k tokens** = MLA sparse attention over the growing cache.
-  Becomes dominant past ~14k context. This is what KPool / FP8-KV / sparse-attn tuning target.
+## Device trace (jax.profiler, host_tracer_level=1) — per-op device time, real decode
+Top device-time families (whole trace window, moe_backend=epmoe, tp=8):
+| family | total ms | count | avg us |
+|---|---|---|---|
+| gmm_v2 g=288 (MoE grouped matmul) | ~159 | 336* | ~200k |
+| all-reduce | 64.9 | 2250 | 28.8 |
+| gather_fusion | 59.1 | 7218 | 8.2 |
+| scatter_offload / collective-permute | ~35 | | |
+| top_k (indexer) | 14.0 | 1100 | 12.7 |
 
-## Kernel micro-benches (context, NOT enough alone — overstate per-layer cost)
-- DSA indexer top-k: Pallas `streamindex_topk` 0.20-0.89 ms (2-3x faster than the jnp ref at
-  high batch/ctx) — but only ~2-10% of the step, so not the main lever.
-- EPMoE standalone: ~1.0 ms (1 tok) / ~1.6 ms (16 tok) incl. dispatch; real per-layer cost
-  inside the jitted loop is ~0.4 ms (18.7ms/45 layers).
+=> **MoE (grouped matmul + expert gather) + cross-device collectives (all-reduce) dominate the
+fixed cost.** The indexer top-k is minor (14 ms over the window).
 
-## Corrected conclusion
-The earlier dummy-weight A/B (showing 6x from DSA_INDEXER_KERNEL) was misleading: with zero
-weights the matmul/MoE cost vanished so the indexer's relative share exploded. With real
-weights the indexer is minor. **The dominant decode cost is the fixed 18.7 ms/step forward.**
+## Experiments tried
+- `SGLANG_JAX_AOT_DISPATCH=auto` (removes O(n_args) per-step host dispatch): decode 55.2 vs 57.4
+  baseline — **no gain**. Host dispatch is NOT the GLM-5.3/TP8 bottleneck (upstream saw it on
+  tp64/753B; our arg count 1644 + tp8 is proportionally cheap).
+- `SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD=1` on top: still ~55 — no gain.
+- `--moe-backend fused_v2` (ep1): 9.6 tok/s — the fused kernel treats the 2D mesh as EP; with
+  ep_size=1 it's wrong.
+- `--moe-backend fused_v2 --ep-size 8`: **1.6 tok/s** — catastrophic; fused block config
+  untuned for 288 experts / hidden 4096. Not viable without tuning.
+- **epmoe (default) remains best: 55-57 tok/s.**
+
+## Next targets (ranked)
+1. EPMoE grouped matmul (`gmm_v2 g=288`) block tuning for hidden 4096 / moe_inter 2048 on v7.
+2. Reduce MoE all-reduce / dispatch traffic (expert sharding layout, EP=1 means experts
+   replicated across the 8 tensor shards + psum(expert) reduce).
+3. MLA tuned-block-size LOOKUP MISS for our decode shape — use a tuned config (currently the
+   hardcoded default).
