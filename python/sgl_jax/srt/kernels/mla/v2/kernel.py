@@ -62,6 +62,16 @@ def align_to(x, a):
     return cdiv(x, a) * a
 
 
+def align_rope_dim(actual_r_dim: int, a: int = 128) -> int:
+    """Padded RoPE dimension used by the MLA cache layout and kernel block shapes.
+
+    A NoPE model (GLM-5.3-Flash) has ``qk_rope_head_dim == 0``; the cache still reserves one aligned
+    block of zeros so the Pallas shapes stay valid. The values are zero and the rotation is a no-op,
+    so this is numerically identical to having no RoPE at all.
+    """
+    return max(cdiv(actual_r_dim, a) * a, a)
+
+
 def get_dtype_bitwidth(dtype):
     return jax.dtypes.itemsize_bits(dtype)
 
@@ -163,7 +173,7 @@ def static_validate_inputs(
     actual_lkv_dim = ql_nope.shape[2]
     actual_r_dim = q_pe.shape[2]
     lkv_dim = align_to(actual_lkv_dim, 128)
-    r_dim = align_to(actual_r_dim, 128)
+    r_dim = align_rope_dim(actual_r_dim)
 
     (
         _,
@@ -1264,17 +1274,16 @@ def _mla_ragged_paged_attention_kernel(
 
 def prepare_q_inputs(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
+    min_dim: int = 0,
 ):
     max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
     q_packing = get_dtype_packing(q.dtype)
     num_q_heads = align_to(actual_num_q_heads, q_packing)
-    head_dim = align_to(actual_head_dim, 128)
+    head_dim = max(align_to(actual_head_dim, 128), min_dim)
+    # reshape to the explicit width only when nonzero (NoPE: actual_head_dim == 0 is invalid).
+    q = q.reshape(max_num_tokens, actual_num_q_heads, actual_head_dim) if actual_head_dim > 0 else q
     q = jnp.pad(
-        q.reshape(
-            max_num_tokens,
-            actual_num_q_heads,
-            actual_head_dim,
-        ),
+        q,
         (
             (0, 0),
             (0, num_q_heads - actual_num_q_heads),
@@ -1295,7 +1304,7 @@ def prepare_q_inputs(
     return q
 
 
-def prepare_kv_inputs(kv: jax.Array):
+def prepare_kv_inputs(kv: jax.Array, min_dim: int = 0):
     max_num_tokens, actual_head_dim = kv.shape
     kv_packing = get_dtype_packing(kv.dtype)
     # Pad to packing
@@ -1303,9 +1312,12 @@ def prepare_kv_inputs(kv: jax.Array):
         pad = kv_packing - (max_num_tokens % kv_packing)
         kv = jnp.pad(kv, ((0, pad), (0, 0)), constant_values=0)
 
-    head_dim = align_to(actual_head_dim, 128)
-    kv = kv.reshape(-1, kv_packing, actual_head_dim)
-    kv = jnp.pad(kv, ((0, 0), (0, 0), (0, head_dim - actual_head_dim)), constant_values=0)
+    head_dim = max(align_to(actual_head_dim, 128), min_dim)
+    # Pad the head dim BEFORE the reshape: reshaping to an explicit 0-wide axis is invalid
+    # (NoPE: actual_head_dim == 0), and the pad target (head_dim) is always >= 128 for rope tensors.
+    if head_dim > actual_head_dim:
+        kv = jnp.pad(kv, ((0, 0), (0, head_dim - actual_head_dim)), constant_values=0)
+    kv = kv.reshape(-1, kv_packing, head_dim)
     return kv
 
 
@@ -1516,9 +1528,9 @@ def mla_ragged_paged_attention(
     ql_nope = prepare_q_inputs(
         ql_nope
     )  # [max_num_tokens, num_q_heads_per_q_packing, q_packing, lkv_dim]
-    q_pe = prepare_q_inputs(q_pe)  # [max_num_tokens, num_q_heads_per_q_packing, q_packing, r_dim]
+    q_pe = prepare_q_inputs(q_pe, min_dim=128)  # [max_num_tokens, num_q_heads_per_q_packing, q_packing, r_dim]
     new_kv_c = prepare_kv_inputs(new_kv_c)  # [max_num_tokens_per_kv_packing, kv_packing, lkv_dim]
-    new_k_pe = prepare_kv_inputs(new_k_pe)  # [max_num_tokens_per_kv_packing, kv_packing, r_dim]
+    new_k_pe = prepare_kv_inputs(new_k_pe, min_dim=128)  # [max_num_tokens_per_kv_packing, kv_packing, r_dim]
     lkv_dim = new_kv_c.shape[-1]
     r_dim = new_k_pe.shape[-1]
 

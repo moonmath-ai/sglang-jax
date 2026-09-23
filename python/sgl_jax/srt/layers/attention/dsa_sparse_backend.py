@@ -195,6 +195,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         idx_weights: jax.Array | None = kwargs.get("idx_weights")
         dsa_topk_in: jax.Array | None = kwargs.get("dsa_topk_in")
         dsa_topk_pages_in: jax.Array | None = kwargs.get("dsa_topk_pages_in")
+        # GLM-5.3-Flash KPool: the indexer keys in the cache are pooled (one per `index_kpool` tokens).
+        indexer_compression_ratio: int = int(kwargs.get("indexer_compression_ratio", 1) or 1)
 
         layer_id = layer.layer_id
         is_full = indexer_type == "full"
@@ -361,6 +363,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         if not is_full or q_idx is None:
             return idx_cache, None, None
 
+        # NOTE: GLM-5.3-Flash KPool (indexer keys pooled by `index_kpool`) needs the indexer cache +
+        # scatter + top-k pipeline reworked to store pooled keys and track a compressed seq_len before
+        # it can be enabled; that variant is not wired yet, so the model leaves compression off.
+
         in_specs = (
             P(dpa, None, None),  # q_idx    [T, H_idx, D_idx] — replicated: softmax needs all heads
             P(dpa, None),  # k_idx    [T, D_idx]
@@ -411,7 +417,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     cuq_,
                     dist_,
                     k=self.index_topk,
-                    # GLM indexer keys are uncompressed (one key per token).
+                    # GLM-5.1/5.2 indexer keys are uncompressed (one key per token). KPool compression
+                    # (GLM-5.3-Flash) is not wired through this page path yet — see `_maybe_index`.
                     compression_ratio=1,
                     num_kv_pages_per_block=_INDEXER_KERNEL_KV_PAGES_PER_BLOCK,
                     num_queries_per_block=1,

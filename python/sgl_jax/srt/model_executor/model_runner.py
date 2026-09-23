@@ -784,10 +784,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
 
             cfg = self.model_config.hf_text_config
+            recurrent = self.linear_recurrent_config
+            active = set(recurrent.full_attention_layer_ids) if recurrent is not None else None
             full_slot, _, _ = build_index_share_map(
                 getattr(cfg, "indexer_types", None),
                 getattr(cfg, "index_skip_topk_offset", 0),
                 cfg.num_hidden_layers,
+                active_layers=active,
             )
             # Per-launch override of the indexer top-k budget (page count = ceil(
             # index_topk / page_size) is a static kernel shape, so this is fixed at

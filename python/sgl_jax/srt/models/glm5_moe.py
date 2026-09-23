@@ -140,10 +140,20 @@ class GlmDsaIndexer(nnx.Module):
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
         scope_name: str = "indexer",
+        rope_dim: int = 64,
+        index_kpool: int = 1,
+        index_kpool_compress: bool = False,
     ):
         self.head_dim = index_head_dim
         self.n_head = index_n_heads
         self.mesh = mesh
+        self.rope_dim = rope_dim
+        # GLM-5.3-Flash KPool: every `index_kpool` consecutive token keys are softmax-pooled into one
+        # slot (weighted by a per-token gate plus a position embedding `ape`). GLM-5.1/5.2 leave this
+        # at 1 / False and keep the token-level indexer.
+        self.index_kpool = index_kpool
+        self.index_kpool_compress = index_kpool_compress and index_kpool > 1
+        self.use_kpool = self.index_kpool_compress
 
         self.wq_b = LinearBase(
             input_size=q_lora_rank,
@@ -175,6 +185,47 @@ class GlmDsaIndexer(nnx.Module):
             scope_name="weights_proj",
         )
 
+        if self.use_kpool:
+            # Compress gate: per-token, per-dimension logit (hidden -> index_head_dim), matching
+            # `glm53.model.mla_project` (`ng = x @ gate`, shape [T, ihd]).
+            self.kpool_gate = LinearBase(
+                input_size=hidden_size,
+                output_size=index_head_dim,
+                use_bias=False,
+                kernel_axes=(None, None),
+                params_dtype=dtype,
+                mesh=mesh,
+                scope_name="index_kpool_compress_gate",
+            )
+            # Position embedding added to each pool member's gate before the softmax: [kpool, ihd].
+            self.kpool_ape = nnx.Param(
+                jnp.zeros((index_kpool, index_head_dim), dtype=dtype, out_sharding=P(None, None))
+            )
+        else:
+            self.kpool_gate = None
+            self.kpool_ape = None
+
+    def pool_keys(self, keys: jax.Array, gates: jax.Array, length: int | None = None) -> jax.Array:
+        """Compress `keys` [T, D] into KPool groups using softmax(gates + ape) weights.
+
+        Group `g` covers positions [g*kp, (g+1)*kp-1]; the gate is per (position, dim). Incomplete
+        trailing groups are masked (weight -inf). Mirrors `glm53.model.pool_new_keys`.
+        """
+        kp = self.index_kpool
+        T, D = keys.shape
+        P = (T + kp - 1) // kp
+        pad = P * kp - T
+        k = jnp.pad(keys, ((0, pad), (0, 0))).reshape(P, kp, D).astype(jnp.float32)       # [P, kp, D]
+        g = jnp.pad(gates, ((0, pad), (0, 0))).reshape(P, kp, D).astype(jnp.float32)      # [P, kp, D]
+        logits = g + self.kpool_ape.value.astype(jnp.float32)[None]                       # + [kp, D]
+        tok_valid = (jnp.arange(P * kp).reshape(P, kp) < T)                               # [P, kp]
+        logits = jnp.where(tok_valid[:, :, None], logits, -jnp.inf)
+        probs = jnp.nan_to_num(jax.nn.softmax(logits, axis=1))                            # [P, kp, D]
+        pooled = (probs * k).sum(1)                                                       # [P, D]
+        if length is not None:
+            return pooled[: (length + kp - 1) // kp]
+        return pooled
+
     def project(
         self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -189,7 +240,7 @@ class GlmDsaIndexer(nnx.Module):
         key, _ = self.wk(hidden_states)
         key = self.k_norm(key)
 
-        rope_dim = 64
+        rope_dim = self.rope_dim
         q_rope = query[:, :, :rope_dim]
         k_rope = key[:, :rope_dim][:, None, :]
         q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
@@ -202,12 +253,18 @@ class GlmDsaIndexer(nnx.Module):
             query = query.at[:, :, :rope_dim].set(q_rope)
             key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
 
-        h_matrix = get_hadamard_matrix(128) * (128**-0.5)
+        h_matrix = get_hadamard_matrix(self.head_dim) * (self.head_dim**-0.5)
         query = jnp.einsum("thd,de->the", query, h_matrix)
         key = jnp.einsum("td,de->te", key, h_matrix)
 
         weights, _ = self.weights_proj(hidden_states)
-        return query, key, weights
+
+        if self.use_kpool:
+            # Per-token, per-dim compress gate [T, ihd]; pool the (rope'd, hadamard'd) keys.
+            gate, _ = self.kpool_gate(hidden_states)                        # [T, ihd]
+            pooled_key = self.pool_keys(key, gate)
+            return query, pooled_key, weights, True
+        return query, key, weights, False
 
     def __call__(
         self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
@@ -220,7 +277,7 @@ class GlmDsaIndexer(nnx.Module):
         key = self.k_norm(key)
 
         # Apply RoPE
-        rope_dim = 64
+        rope_dim = self.rope_dim
         q_rope = query[:, :, :rope_dim]
         k_rope = key[:, :rope_dim]
         k_rope = k_rope[:, None, :]  # Add head dim for RoPE
@@ -236,8 +293,8 @@ class GlmDsaIndexer(nnx.Module):
             key = key.at[:, :rope_dim].set(k_rope)
 
         # Apply Hadamard Transform
-        h_matrix = get_hadamard_matrix(128)
-        h_matrix = h_matrix * (128**-0.5)
+        h_matrix = get_hadamard_matrix(self.head_dim)
+        h_matrix = h_matrix * (self.head_dim**-0.5)
 
         query = jnp.einsum("thd,de->the", query, h_matrix)
         key = jnp.einsum("td,de->te", key, h_matrix)
@@ -283,6 +340,16 @@ class Glm5Attention(nnx.Module):
         has_indexer: bool = True,
         indexer_type: str = "full",
         use_dsa_sparse: bool = False,
+        q_lora_rank: int = 2048,
+        kv_lora_rank: int = 512,
+        qk_nope_head_dim: int = 192,
+        qk_rope_head_dim: int = 64,
+        v_head_dim: int = 256,
+        index_head_dim: int = 128,
+        index_n_heads: int = 32,
+        indexer_rope_dim: int | None = None,
+        index_kpool: int = 1,
+        index_kpool_compress: bool = False,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -292,20 +359,24 @@ class Glm5Attention(nnx.Module):
         self.indexer_type = indexer_type
         self.use_dsa_sparse = use_dsa_sparse
 
-        self.qk_nope_head_dim = 192
-        self.qk_rope_head_dim = 64
-        self.qk_head_dim = 256
-        self.v_head_dim = 256
-        self.kv_lora_rank = 512
-        self.q_lora_rank = 2048
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+        self.kv_lora_rank = kv_lora_rank
+        self.q_lora_rank = q_lora_rank
 
-        self.scaling = 256**-0.5
+        self.scaling = self.qk_head_dim**-0.5
 
         self.use_qk_norm = use_qk_norm
 
         if use_qk_norm:
-            self.q_norm = RMSNorm(256, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="q_norm")
-            self.k_norm = RMSNorm(256, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="k_norm")
+            self.q_norm = RMSNorm(
+                self.qk_nope_head_dim, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="q_norm"
+            )
+            self.k_norm = RMSNorm(
+                self.qk_nope_head_dim, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="k_norm"
+            )
         else:
             self.q_norm = None
             self.k_norm = None
@@ -368,11 +439,14 @@ class Glm5Attention(nnx.Module):
             self.indexer = GlmDsaIndexer(
                 hidden_size=hidden_size,
                 q_lora_rank=self.q_lora_rank,
-                index_head_dim=128,
-                index_n_heads=32,
+                index_head_dim=index_head_dim,
+                index_n_heads=index_n_heads,
                 mesh=mesh,
                 dtype=dtype,
                 scope_name="indexer",
+                rope_dim=(indexer_rope_dim if indexer_rope_dim is not None else self.qk_rope_head_dim) or 0,
+                index_kpool=index_kpool,
+                index_kpool_compress=index_kpool_compress,
             )
         else:
             self.indexer = None
@@ -384,6 +458,18 @@ class Glm5Attention(nnx.Module):
             is_neox_style=False,
             dtype=dtype,
             mesh=mesh,
+        )
+        # The indexer may keep its own RoPE even when the attention is NoPE (GLM-5.3: qk_rope=0 but the
+        # DSA indexer rope dim is 64). Build a dedicated embedding so the attention's 0-size one is unused.
+        _ix_rope = indexer_rope_dim if indexer_rope_dim is not None else self.qk_rope_head_dim
+        self.indexer_rope_dim = _ix_rope
+        self.indexer_rotary_emb = (
+            RotaryEmbedding(
+                head_size=_ix_rope, rotary_dim=_ix_rope, max_position_embeddings=max_position_embeddings,
+                base=rope_theta, is_neox_style=False,
+                dtype=dtype, mesh=mesh,
+            )
+            if _ix_rope > 0 else None
         )
 
         self.use_absorbed = use_absorbed
@@ -547,14 +633,17 @@ class Glm5Attention(nnx.Module):
             dsa_kwargs["dsa_topk_in"] = dsa_topk_in
             dsa_kwargs["dsa_topk_pages_in"] = dsa_topk_pages_in
             if self.indexer is not None:
-                q_idx, k_idx, idx_w = self.indexer.project(
-                    hidden_states, q_compressed, positions, self.rotary_emb
+                q_idx, k_idx, idx_w, kpooled = self.indexer.project(
+                    hidden_states, q_compressed, positions,
+                    self.indexer_rotary_emb or self.rotary_emb,
                 )
                 dsa_kwargs["q_idx"] = q_idx
                 dsa_kwargs["k_idx"] = k_idx
                 dsa_kwargs["idx_weights"] = idx_w
+                if kpooled:
+                    dsa_kwargs["indexer_compression_ratio"] = self.indexer.index_kpool
         elif self.indexer is not None:
-            _ = self.indexer(hidden_states, q_compressed, positions, self.rotary_emb)
+            _ = self.indexer(hidden_states, q_compressed, positions, self.indexer_rotary_emb or self.rotary_emb)
 
         q_nope = q[:, :, : self.qk_nope_head_dim]
         q_rope = q[:, :, self.qk_nope_head_dim :]
@@ -563,8 +652,11 @@ class Glm5Attention(nnx.Module):
         compressed, k_rope = jnp.split(latent_cache, [self.kv_lora_rank], axis=-1)
         compressed = self.kv_a_layernorm(compressed)
 
-        k_rope = k_rope.reshape(-1, 1, self.qk_rope_head_dim)
-        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+        if self.qk_rope_head_dim > 0:
+            k_rope = k_rope.reshape(-1, 1, self.qk_rope_head_dim)
+            q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+        # NoPE (qk_rope_head_dim == 0): q_rope/k_rope stay empty; the absorbed MLA path treats the latent
+        # as the whole of k (GLM-5.3-Flash).
 
         if self.use_absorbed:
             attn_output, kv_fused = self._forward_mqa(
@@ -1197,8 +1289,9 @@ class Glm5ForCausalLM(nnx.Module):
         is_mlp_layer: bool,
         is_static_quant: bool = False,
         has_indexer: bool = True,
+        hf_prefix: str = "model.layers",
     ) -> dict:
-        prefix = f"model.layers.{target_idx}"
+        prefix = f"{hf_prefix}.{target_idx}"
         target_prefix = f"model.layers.{layer_idx}"
 
         mappings = {

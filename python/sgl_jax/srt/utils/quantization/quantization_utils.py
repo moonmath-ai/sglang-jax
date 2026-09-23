@@ -141,12 +141,30 @@ def apply_linear_quantization(
 
     ignored_layers = quant_config.ignored_layers or []
 
-    # Normalize ignored layer patterns: convert HF dot-index (layers.0.) to
-    # bracket-index (layers[0].) since the model walk uses bracket notation.
-    normalized_ignored = []
-    for ig in ignored_layers:
-        normalized_ignored.append(re.sub(r"\.(\d+)\.", r"[\1].", ig))
-    ignored_layers = normalized_ignored
+    def _canon(path: str) -> str:
+        """Canonicalize a module path or an ignore entry for comparison.
+
+        Handles the differences between the HF `modules_to_not_convert` entries and the model's
+        internal walk path:
+          * dot layer index (`layers.0.`) vs bracket (`layers[0].`)
+          * a `language_model.` / leading `model.` wrapper
+          * GLM-5.3's extra `.attn.` nesting (`self_attn.attn.q_conv1d` on the model side,
+            `self_attn.q_conv1d` in the config)
+        """
+        p = path.replace("/", ".")
+        p = re.sub(r"\.(\d+)\.", r"[\1].", p)          # layers.0. -> layers[0].
+        p = p.replace("language_model.", "")           # GLM-5.3 checkpoint wrapper
+        p = p.replace(".attn.", ".")                   # model's RadixLinearAttention nesting
+        # GLM-5.3 mHC: the checkpoint names tensors `hc_attn_fn` (flat); the model nests them
+        # as `hc_attn.fn`. Fold the underscore form to the nested form.
+        p = re.sub(r"\.hc_(attn|ffn)_(fn|base|scale)", r".hc_\1.\2", p)
+        return p
+
+    _canon_ignored = [_canon(ig) for ig in ignored_layers]
+
+    def _is_ignored(dp: str) -> bool:
+        c = _canon(dp)
+        return any(c == ig or c.endswith(f".{ig}") for ig in _canon_ignored)
 
     def _find_matching_rule(path: str):
         """Find the first rule that matches the given module path."""
@@ -173,10 +191,7 @@ def apply_linear_quantization(
                 if isinstance(attr_value, LinearBase):
                     # Check if this path matches any rule
                     dot_path = child_path.replace("/", ".")
-                    if any(
-                        dot_path == ignored or dot_path.endswith(f".{ignored}")
-                        for ignored in ignored_layers
-                    ):
+                    if _is_ignored(dot_path):
                         logger.info("Skipping %s - in ignored_layers", dot_path)
                         continue
 
