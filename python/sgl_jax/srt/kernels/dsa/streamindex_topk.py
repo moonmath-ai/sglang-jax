@@ -733,13 +733,42 @@ def _xla_select(scores: jax.Array, k: int) -> jax.Array:
     return jnp.where(top_vals == -jnp.inf, -1, top_idxs)
 
 
+def _chunked_select(scores: jax.Array, k: int) -> jax.Array:
+    """Exact top-k without sorting a row that exceeds SparseCore VMEM.
+
+    Every global top-k item must be among its chunk's top-k (ties may choose
+    any equally scored item). Flatten chunks into independent selector rows,
+    then select from their winners. Neither selector sees the full row width.
+    """
+    batch, width = scores.shape
+    chunk_width = max(131072, k)
+    chunks = cdiv(width, chunk_width)
+    padded = jnp.pad(scores, ((0, 0), (0, chunks * chunk_width - width)), constant_values=-jnp.inf)
+    rows = padded.reshape(batch * chunks, chunk_width)
+    local = select_topk_indices(rows, k, backend="auto")
+    values = jnp.take_along_axis(rows, jnp.maximum(local, 0), axis=1)
+    values = jnp.where(local >= 0, values, -jnp.inf).reshape(batch, chunks * k)
+    offsets = jnp.arange(chunks, dtype=jnp.int32)[None, :, None] * chunk_width
+    candidates = (local.reshape(batch, chunks, k) + offsets).reshape(batch, chunks * k)
+    winners = select_topk_indices(values, k, backend="auto")
+    result = jnp.take_along_axis(candidates, jnp.maximum(winners, 0), axis=1)
+    return jnp.where(winners >= 0, result, -1)
+
+
 def select_topk_indices(scores: jax.Array, k: int, *, backend: str = "auto") -> jax.Array:
     """Exact top-k indices of ``scores`` ([T, E] f32, -inf = invalid), descending, -1 tail.
 
     backend: "auto" routes by ``should_use_sc_topk``; "sc" / "xla" force a path.
+    "chunked" uses auto routing when the row fits SparseCore, otherwise an
+    exact two-stage selection for rows wider than 131072 entries.
     """
     if scores.shape[-1] < k:
         scores = jnp.pad(scores, ((0, 0), (0, k - scores.shape[-1])), constant_values=-jnp.inf)
+    if backend == "chunked":
+        fits_sc = sc_topk_available() and should_use_sc_topk(scores.shape[-1], scores.shape[0])
+        if not fits_sc and scores.shape[-1] > max(131072, k):
+            return _chunked_select(scores, k)
+        backend = "auto"
     if backend == "auto":
         use_sc = sc_topk_available() and should_use_sc_topk(scores.shape[-1], scores.shape[0])
     elif backend == "sc":
@@ -752,7 +781,7 @@ def select_topk_indices(scores: jax.Array, k: int, *, backend: str = "auto") -> 
     elif backend == "xla":
         use_sc = False
     else:
-        raise ValueError(f"unknown top-k backend {backend!r}; expected auto | sc | xla")
+        raise ValueError(f"unknown top-k backend {backend!r}; expected auto | sc | xla | chunked")
     return _sc_select(scores, k) if use_sc else _xla_select(scores, k)
 
 
@@ -809,7 +838,8 @@ def streamindex_topk(
         pallas kernel. This is a tuple of (decode, prefill, mixed) cases.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
       topk_backend: exit-stage selector: "auto" (SparseCore radix select when
-        available and the row is large enough, else XLA), "sc" or "xla".
+        available and the row is large enough, else XLA), "sc", "xla", or
+        "chunked" (exact bounded selection for rows too large for SparseCore).
 
     Returns:
       Top-K indices (in compressed space).

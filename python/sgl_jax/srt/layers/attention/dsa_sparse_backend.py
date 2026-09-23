@@ -5,8 +5,8 @@ attention runs over at most ``index_topk`` KV positions per query. IndexShare
 (GLM-5.2) is realised by threading the last full-layer's ``topk_indices``
 through the model's per-layer loop and reusing it on ``shared`` layers.
 
-Phase A path uses jnp reference kernels (:mod:`sgl_jax.srt.kernels.dsa.ref`);
-DECODE runs the Pallas ``sparse_mla_page_level``; EXTEND falls back to
+DECODE uses live-context Pallas indexer scoring and bounded top-k selection,
+followed by Pallas ``sparse_mla_page_level``; EXTEND falls back to
 plain dense (the indexer still writes idx cache for later decode steps).
 """
 
@@ -28,6 +28,7 @@ from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import prefill_write_and_attend_
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
     prefill_write_and_attend_ragged_qblock,
 )
+from sgl_jax.srt.kernels.dsa.streamindex_live import streamindex_topk_live
 from sgl_jax.srt.kernels.dsa.streamindex_topk import (
     streamindex_page_topk,
     streamindex_topk,
@@ -49,6 +50,12 @@ _SPARSE_PALLAS_MAX_T = 1
 # token-topk + page-union path with k_pages_max=512). Bounds sparse-MLA cost
 # to O(budget) flat vs the union path which saturates 512 pages at long ctx.
 _PAGE_TOPK_BUDGET = int(os.environ.get("DSA_PAGE_TOPK", "0"))
+# Decode: score live KV blocks and select over a per-request context bucket.
+# Set DSA_INDEXER_LIVE=0 to restore the previous ref/DSA_INDEXER_KERNEL routing.
+# DSA_PAGE_TOPK retains priority. The live path supports uncompressed BF16
+# caches with 128-aligned head dimensions; other formats keep prior routing.
+# This does not bypass scoring short contexts.
+_INDEXER_LIVE = os.environ.get("DSA_INDEXER_LIVE", "1") == "1"
 # Opt-in: score+topk via the Pallas streamindex kernel instead of the jnp
 # reference. The kernel reads O(actual kv_len) pages (vs the ref's O(max_ctx)
 # padded gather) and shares the ref's exact scoring semantics
@@ -407,7 +414,26 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     one_token_per_seq=True,
                 )
                 return cache3d.reshape(cache_.shape), topk, topk_pages
-            if compute_topk and _INDEXER_KERNEL:
+            if (
+                compute_topk
+                and _INDEXER_LIVE
+                and cache3d.dtype == jnp.bfloat16
+                and idx_dim % 128 == 0
+                and page_size % 2 == 0
+            ):
+                topk = streamindex_topk_live(
+                    q_,
+                    w_,
+                    cache3d,
+                    seq_lens_,
+                    pi_,
+                    cuq_,
+                    cukv_,
+                    dist_,
+                    k=self.index_topk,
+                    pages_per_seq=pages_per_seq,
+                )
+            elif compute_topk and _INDEXER_KERNEL:
                 topk = streamindex_topk(
                     q_,
                     w_,

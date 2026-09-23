@@ -5,8 +5,6 @@ produces, including the ``-inf`` columns the kernel leaves for masked / never-wr
 entries and the ``E < k`` case that must yield trailing ``-1``.
 """
 
-import os
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -206,3 +204,28 @@ def test_streamindex_topk_sc_matches_xla_end_to_end(B, T_per_seq, ctx):
     assert _trailing_minus_one(outs["sc"])
     if ctx == 1024:
         assert np.all((outs["sc"] >= 0).sum(1) == 256)
+
+
+def test_chunked_selector_handles_concentrated_winners_padding_and_ties():
+    """Oversized rows cannot lose winners at chunk edges or invent valid slots."""
+    width, k = 786439, 2048
+    rng = np.random.default_rng(123)
+    scores = rng.standard_normal((4, width), np.float32)
+    # Concentrate more than k winners in one chunk, including its right edge.
+    scores[0, 131072 - 4096 : 131072] += 10
+    scores[1] = -np.inf
+    scores[1, -129:] = -np.arange(1, 130, dtype=np.float32)
+    scores[2] = -np.inf
+    scores[3] = 0  # tied ranks can return any unique valid k positions
+    got = np.asarray(
+        jax.jit(lambda x: select_topk_indices(x, k, backend="chunked"))(jnp.asarray(scores))
+    )
+    assert got.shape == (4, k) and _trailing_minus_one(got)
+    for row, expected_count in enumerate([k, 129, 0, k]):
+        indices = got[row, :expected_count]
+        assert len(np.unique(indices)) == expected_count
+        assert np.all((indices >= 0) & (indices < width))
+        assert np.all(got[row, expected_count:] == -1)
+        if expected_count:
+            expected_values = np.sort(scores[row])[-expected_count:][::-1]
+            np.testing.assert_array_equal(scores[row, indices], expected_values)
