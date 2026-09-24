@@ -89,6 +89,22 @@ def test_bucket_crossings_and_packed_page_offsets():
         np.testing.assert_array_equal(inputs[2], host[2])
 
 
+def test_same_bucket_rows_are_batched_across_partial_groups():
+    # Bucket populations 3, 2, 2, 1 force group boundaries to split runs,
+    # including a final partial group at the end of the active batch.
+    # Packed starts differ per request, so each grouped Pallas call must also
+    # gather the right row-specific page table before using fixed-stride input.
+    lengths = [100, 200, 300, 2049, 2050, 4097, 5000, 8193]
+    host = make_inputs(lengths, capacity=65, seed=19)
+
+    def run(*args):
+        return streamindex_topk_live(*args, k=K, pages_per_seq=65)
+
+    inputs = tuple(map(jnp.asarray, host))
+    compiled = jax.jit(run).lower(*inputs).compile()
+    verify(host, compiled(*inputs))
+
+
 @pytest.mark.parametrize("weight", [0.0, -1.0])
 def test_ties_negative_scores_and_inactive_rows(weight):
     host = list(make_inputs([128, 1, 128], capacity=1, active=2))

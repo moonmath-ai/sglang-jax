@@ -54,10 +54,9 @@ def streamindex_topk_live(
     and an uncompressed BF16 cache [physical_pages,page_size,head_dim].
     The caller writes current keys before invoking this function.
 
-    Each active row selects its own bucket at runtime. Do not vmap the switch:
-    that would evaluate every bucket and restore full-capacity work. Requests
-    currently execute sequentially; independent request scheduling is separate
-    from eliminating capacity-dependent work.
+    Active rows are sorted by their live-context bucket and processed in
+    same-bucket groups of up to four. Do not vmap the bucket switch: that would
+    evaluate every bucket and restore full-capacity work.
 
     Scoring follows the existing Pallas kernel; selection is exact top-k
     (subject to floating-point scoring and tie ordering), unlike the reference's
@@ -90,18 +89,44 @@ def streamindex_topk_live(
     if cache_kv.dtype != jnp.bfloat16 or page_size % 2:
         raise ValueError("Live indexer requires BF16 cache and an even page size")
     cache4d = cache_kv.reshape(cache_kv.shape[0], page_size // 2, 2, cache_kv.shape[-1])
-    one_cuq = jnp.asarray([0, 1], jnp.int32)
-    one_dist = jnp.asarray([1, 1, 1], jnp.int32)
+    if batch == 0:
+        return jnp.full((0, k), -1, jnp.int32)
 
-    def make_branch(bucket_pages):
-        def score_and_select(args):
-            q_row, w_row, length, page_start = args
-            pages = jax.lax.dynamic_slice_in_dim(page_indices, page_start, bucket_pages)
-            return streamindex_topk(
-                q_row,
-                w_row,
+    group_size = min(4, batch)
+    # Leave one group's lookahead after the real rows: a bucket run can end
+    # at any row, so the final partial group still needs a full static slice.
+    padded_batch = ((batch + group_size - 1) // group_size) * group_size + group_size - 1
+    if padded_batch != batch:
+        q = jnp.pad(q, ((0, padded_batch - batch), (0, 0), (0, 0)))
+        weights = jnp.pad(weights, ((0, padded_batch - batch), (0, 0)))
+        seq_lens = jnp.pad(seq_lens, ((0, padded_batch - batch),))
+        page_starts = jnp.pad(cu_kv_lens[:-1] // page_size, ((0, padded_batch - batch),))
+    else:
+        page_starts = cu_kv_lens[:-1] // page_size
+
+    row_ids = jnp.arange(padded_batch, dtype=jnp.int32)
+    active = (row_ids < distribution[0]) & (seq_lens > 0)
+    row_buckets = jnp.sum(seq_lens[:, None] > limits[None, :], axis=1, dtype=jnp.int32)
+    row_buckets = jnp.where(active, row_buckets, len(buckets))
+    order = jnp.argsort(row_buckets, stable=True)
+    sorted_buckets = row_buckets[order]
+    active_count = jnp.sum(active, dtype=jnp.int32)
+
+    one_cuq = jnp.arange(group_size + 1, dtype=jnp.int32)
+    one_dist = jnp.asarray([group_size, group_size, group_size], jnp.int32)
+    bucket_branches = []
+
+    for bucket_pages in buckets:
+        def score_and_select(args, bucket_pages=bucket_pages):
+            q_group, w_group, lengths_group, starts_group, group_order, out = args
+            offsets = starts_group[:, None] + jnp.arange(bucket_pages, dtype=jnp.int32)[None, :]
+            offsets = jnp.minimum(offsets, page_indices.shape[0] - 1)
+            pages = page_indices[offsets].reshape(-1)
+            selected = streamindex_topk(
+                q_group,
+                w_group,
                 cache4d,
-                length,
+                lengths_group,
                 pages,
                 one_cuq,
                 one_dist,
@@ -109,27 +134,36 @@ def streamindex_topk_live(
                 compression_ratio=1,
                 num_kv_pages_per_block=min(bucket_pages, num_kv_pages_per_block),
                 num_queries_per_block=1,
-                decode_req_batch_size=1,
+                decode_req_batch_size=group_size,
                 topk_backend="chunked",
             )
+            old = out[group_order]
+            return out.at[group_order].set(jnp.where(lengths_group[:, None] > 0, selected, old))
 
-        return score_and_select
+        bucket_branches.append(score_and_select)
 
-    branches = tuple(make_branch(pages) for pages in buckets)
+    def condition(carry):
+        cursor, _ = carry
+        return cursor < active_count
 
-    def row_step(seq_id, out):
-        length = jax.lax.dynamic_slice_in_dim(seq_lens, seq_id, 1)
-        active = (seq_id < distribution[0]) & (length[0] > 0)
-        q_row = jax.lax.dynamic_slice_in_dim(q, seq_id, 1)
-        w_row = jax.lax.dynamic_slice_in_dim(weights, seq_id, 1)
-        page_start = cu_kv_lens[seq_id] // page_size
-        bucket = jnp.sum(length[0] > limits, dtype=jnp.int32)
-        indices = jax.lax.cond(
-            active,
-            lambda args: jax.lax.switch(bucket, branches, args),
-            lambda args: jnp.full((1, k), -1, jnp.int32),
-            (q_row, w_row, length, page_start),
+    def group_step(carry):
+        cursor, out = carry
+        group_order = jax.lax.dynamic_slice_in_dim(order, cursor, group_size)
+        group_buckets = jax.lax.dynamic_slice_in_dim(sorted_buckets, cursor, group_size)
+        bucket = group_buckets[0]
+        in_bucket = group_buckets == bucket
+        run_size = jnp.sum(in_bucket, dtype=jnp.int32)
+        q_group = q[group_order]
+        w_group = weights[group_order]
+        lengths_group = jnp.where(in_bucket, seq_lens[group_order], 0)
+        starts_group = page_starts[group_order]
+        out = jax.lax.switch(
+            bucket,
+            tuple(bucket_branches),
+            (q_group, w_group, lengths_group, starts_group, group_order, out),
         )
-        return jax.lax.dynamic_update_slice_in_dim(out, indices, seq_id, 0)
+        return cursor + run_size, out
 
-    return jax.lax.fori_loop(0, batch, row_step, jnp.full((batch, k), -1, jnp.int32))
+    out = jnp.full((padded_batch, k), -1, jnp.int32)
+    _, out = jax.lax.while_loop(condition, group_step, (jnp.asarray(0, jnp.int32), out))
+    return out[:batch]
