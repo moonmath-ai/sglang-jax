@@ -51,6 +51,7 @@ from sgl_jax.srt.models.glm5_moe import (
     Glm5Attention,
     Glm5MLP,
     GlmNorm,
+    _requantize_glm5_shared_expert,
 )
 from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -129,7 +130,7 @@ class Glm5NextHC(nnx.Module):
         d = streams.shape[-1] // hc
         streams_htd = streams.reshape(*lead, hc, d).astype(jnp.float32)
         y = y.astype(jnp.float32)
-        out = post[..., None] * y[..., None, :] + jnp.einsum("...ij,...jd->...id", comb, streams_htd)
+        out = post[..., None] * y[..., None, :] + jnp.einsum("...ij,...id->...jd", comb, streams_htd)
         return out.reshape(*lead, hc * d).astype(streams.dtype)
 
 
@@ -162,7 +163,7 @@ class Glm5NextDecoderLayer(nnx.Module):
                 num_kv_heads=config.num_key_value_heads,
                 max_position_embeddings=config.max_position_embeddings,
                 mesh=mesh,
-                rope_theta=getattr(config, "rope_theta", 10000.0),
+                rope_theta=getattr(config, "rope_theta", 800000.0),
                 rope_scaling=getattr(config, "rope_scaling", None),
                 rms_norm_eps=config.rms_norm_eps,
                 use_qk_norm=config.use_qk_norm,
@@ -179,7 +180,7 @@ class Glm5NextDecoderLayer(nnx.Module):
                 v_head_dim=config.v_head_dim,
                 index_head_dim=config.index_head_dim,
                 index_n_heads=config.index_n_heads,
-                indexer_rope_dim=getattr(config, "indexer_rope_dim", 64),
+                indexer_rope_dim=getattr(config, "indexer_rope_dim", 0),
                 index_kpool=getattr(config, "index_kpool", 1),
                 index_kpool_compress=getattr(config, "index_kpool_compress", False),
             )
@@ -245,6 +246,49 @@ class Glm5NextDecoderLayer(nnx.Module):
                 moe_shared_expert_intermediate_size=config.moe_intermediate_size,
                 quantization_config=getattr(config, "quantization_config", None),
             )
+            # Static FP8 checkpoints store block scales for shared experts. The
+            # fused weight loader needs matching parameters on the in-kernel path.
+            quant_config = getattr(config, "quantization_config", None)
+            weight_block_size = (
+                getattr(quant_config, "weight_block_size", None) if quant_config else None
+            )
+            if (
+                use_inkernel_se
+                and getattr(quant_config, "is_static_checkpoint", False)
+                and weight_block_size is not None
+            ):
+                block_n, block_k = map(int, weight_block_size)
+                shared_intermediate = config.moe_intermediate_size * num_shared
+                if (
+                    config.hidden_size % block_k
+                    or shared_intermediate % block_n
+                    or config.hidden_size % block_n
+                    or shared_intermediate % block_k
+                ):
+                    raise ValueError(
+                        f"Shared expert dimensions must divide {weight_block_size=}"
+                    )
+                self.mlp.w1_shared_block_scale = nnx.Param(
+                    jnp.zeros(
+                        (shared_intermediate // block_n, config.hidden_size // block_k),
+                        dtype=jnp.float32,
+                    ),
+                    out_sharding=P(None, None),
+                )
+                self.mlp.w3_shared_block_scale = nnx.Param(
+                    jnp.zeros(
+                        (shared_intermediate // block_n, config.hidden_size // block_k),
+                        dtype=jnp.float32,
+                    ),
+                    out_sharding=P(None, None),
+                )
+                self.mlp.w2_shared_block_scale = nnx.Param(
+                    jnp.zeros(
+                        (config.hidden_size // block_n, shared_intermediate // block_k),
+                        dtype=jnp.float32,
+                    ),
+                    out_sharding=P(None, None),
+                )
         elif self.moe_backend == MoEBackend.FUSED:
             self.mlp = FusedEPMoE(
                 **common,
@@ -425,6 +469,12 @@ class Glm5NextForConditionalGeneration(nnx.Module):
             qc = getattr(config, "quantization_config", None) or getattr(text, "quantization_config", None)
             if qc is not None:
                 cfg.quantization_config = qc
+            # The runner sets these on the outer HF config. Normalization reads
+            # the nested text config, so preserve the serving MoE choices.
+            cfg.moe_backend = getattr(
+                config, "moe_backend", getattr(text, "moe_backend", MoEBackend.EPMOE)
+            )
+            cfg.ep_size = getattr(config, "ep_size", getattr(text, "ep_size", 1))
         else:
             cfg = config
         self.config = cfg
@@ -451,6 +501,8 @@ class Glm5NextForConditionalGeneration(nnx.Module):
         for layer in self.model.layers:
             if not layer.is_kda:
                 layer.self_attn.post_load_weights()
+            if isinstance(getattr(layer, "mlp", None), FusedEPMoEV2):
+                _requantize_glm5_shared_expert(layer.mlp)
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "post_load_weights"):
                 layer.mlp.post_load_weights()
             if getattr(layer, "shared_experts", None) is not None and hasattr(layer.shared_experts, "post_load_weights"):

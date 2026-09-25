@@ -79,7 +79,7 @@ class Glm5NextConfig(PretrainedConfig):
         hc_sinkhorn_iters: int = 20,
         hc_eps: float = 1e-6,
         # rope / position
-        rope_theta: float = 10000.0,
+        rope_theta: float = 800000.0,
         max_position_embeddings: int = 1048576,
         tie_word_embeddings: bool = False,
         attention_bias: bool = False,
@@ -300,7 +300,7 @@ def get_glm5_next_config(hf_config: Any) -> Glm5NextConfig | None:
         hc_mult=g("hc_mult", 4),
         hc_sinkhorn_iters=g("hc_sinkhorn_iters", 20),
         hc_eps=g("hc_eps", 1e-6),
-        rope_theta=g("rope_theta", 10000.0),
+        rope_theta=g("rope_theta", 800000.0),
         max_position_embeddings=g("max_position_embeddings", 1048576),
         tie_word_embeddings=g("tie_word_embeddings", False),
         attention_bias=g("attention_bias", False),

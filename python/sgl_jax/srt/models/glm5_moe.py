@@ -241,17 +241,18 @@ class GlmDsaIndexer(nnx.Module):
         key = self.k_norm(key)
 
         rope_dim = self.rope_dim
-        q_rope = query[:, :, :rope_dim]
-        k_rope = key[:, :rope_dim][:, None, :]
-        q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
-        if _INDEXER_ROPE_CONCAT:
-            # concat instead of at[].set: avoids a read-modify-write of the
-            # full [T, n_head, head_dim] tensor (values are identical).
-            query = jnp.concatenate((q_rope, query[:, :, rope_dim:]), axis=-1)
-            key = jnp.concatenate((k_rope.squeeze(1), key[:, rope_dim:]), axis=-1)
-        else:
-            query = query.at[:, :, :rope_dim].set(q_rope)
-            key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
+        if rope_dim > 0:
+            q_rope = query[:, :, :rope_dim]
+            k_rope = key[:, :rope_dim][:, None, :]
+            q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
+            if _INDEXER_ROPE_CONCAT:
+                # concat instead of at[].set: avoids a read-modify-write of the
+                # full [T, n_head, head_dim] tensor (values are identical).
+                query = jnp.concatenate((q_rope, query[:, :, rope_dim:]), axis=-1)
+                key = jnp.concatenate((k_rope.squeeze(1), key[:, rope_dim:]), axis=-1)
+            else:
+                query = query.at[:, :, :rope_dim].set(q_rope)
+                key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
 
         h_matrix = get_hadamard_matrix(self.head_dim) * (self.head_dim**-0.5)
         query = jnp.einsum("thd,de->the", query, h_matrix)
