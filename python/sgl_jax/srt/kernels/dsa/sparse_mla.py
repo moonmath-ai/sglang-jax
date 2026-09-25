@@ -48,8 +48,7 @@ def compute_topk_pages(
     """
     pages = topk_indices // page_size
     valid = (topk_indices >= 0) & (pages < pages_per_seq)
-    # The sentinel sorts after every valid page, including out-of-range ids
-    # which the old one-hot operation silently ignored.
+    # The sentinel sorts after every valid page so invalid entries drop out.
     pages = jnp.sort(jnp.where(valid, pages, pages_per_seq), axis=-1)
     first = jnp.ones_like(pages[:, :1], dtype=jnp.bool_)
     unique = jnp.concatenate([first, pages[:, 1:] != pages[:, :-1]], axis=-1)

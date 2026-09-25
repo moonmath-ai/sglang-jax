@@ -828,10 +828,8 @@ def _build_recurrent_track_entries(
         )
         indices.append(entry.track_index)
         mask.append(1 if entry.track_mask else 0)
-    # No request is on a snapshot boundary this forward. Return None so the
-    # recurrent backends take their no-tracking path (identical to running with
-    # the extra buffer disabled) instead of materializing an all-false-mask
-    # scatter over the whole state pool on every token.
+    # No snapshot boundary this forward: return None so the recurrent backends
+    # skip the all-false-mask scatter over the whole state pool.
     if not any(mask):
         return None, None
     return (

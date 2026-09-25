@@ -21,37 +21,25 @@ there for the math and its provenance.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
-from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.glm5_next import Glm5NextConfig, get_glm5_next_config
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
-from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
-from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
+from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
 from sgl_jax.srt.layers.layernorm import RMSNorm
-from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import (
-    EPMoE,
-    FusedEPMoE,
-    FusedEPMoEV2,
-    GateLogit,
-    TopK,
-    create_moe_weights_mapping,
-)
-from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.layers.moe import FusedEPMoEV2
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.glm5_moe import (
     Glm5Attention,
     Glm5MLP,
-    GlmNorm,
     _requantize_glm5_shared_expert,
+    build_moe_sublayer,
 )
 from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -200,117 +188,7 @@ class Glm5NextDecoderLayer(nnx.Module):
             self.topk = None
             self.shared_experts = None
         else:
-            self._build_moe(config, mesh, layer_id, dtype)
-
-    def _build_moe(self, config, mesh, layer_id, dtype):
-        self.moe_gate = GateLogit(
-            input_size=config.hidden_size,
-            num_experts=config.n_routed_experts,
-            enable_expert_bias=True,
-            weight_dtype=jnp.bfloat16,
-            compute_dtype=jnp.float32,
-            bias_dtype=jnp.float32,
-            score_func=getattr(config, "scoring_func", "sigmoid"),
-        )
-        self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
-        self.use_fused = self.moe_backend in (MoEBackend.FUSED, MoEBackend.FUSED_V2)
-        num_shared = getattr(config, "n_shared_experts", 0)
-        use_inkernel_se = self.moe_backend == MoEBackend.FUSED_V2 and num_shared > 0
-        self.topk = TopK(
-            topk=config.num_experts_per_tok,
-            renormalize=config.norm_topk_prob,
-            num_expert_group=getattr(config, "n_group", 1),
-            topk_group=getattr(config, "topk_group", 1),
-            routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
-            layer_id=layer_id,
-            mesh=mesh,
-        )
-        common = dict(
-            hidden_size=config.hidden_size,
-            num_experts=config.n_routed_experts,
-            num_experts_per_tok=config.num_experts_per_tok,
-            ep_size=getattr(config, "ep_size", 1),
-            mesh=mesh,
-            intermediate_dim=config.moe_intermediate_size,
-            layer_id=layer_id,
-        )
-        if self.moe_backend == MoEBackend.FUSED_V2:
-            self.mlp = FusedEPMoEV2(
-                **common,
-                renormalize_topk_logits=config.norm_topk_prob,
-                routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
-                use_grouped_topk=getattr(config, "n_group", 1) > 1,
-                num_groups=getattr(config, "n_group", 1),
-                top_k_groups=getattr(config, "topk_group", 1),
-                num_shared_experts=num_shared if use_inkernel_se else 0,
-                moe_shared_expert_intermediate_size=config.moe_intermediate_size,
-                quantization_config=getattr(config, "quantization_config", None),
-            )
-            # Static FP8 checkpoints store block scales for shared experts. The
-            # fused weight loader needs matching parameters on the in-kernel path.
-            quant_config = getattr(config, "quantization_config", None)
-            weight_block_size = (
-                getattr(quant_config, "weight_block_size", None) if quant_config else None
-            )
-            if (
-                use_inkernel_se
-                and getattr(quant_config, "is_static_checkpoint", False)
-                and weight_block_size is not None
-            ):
-                block_n, block_k = map(int, weight_block_size)
-                shared_intermediate = config.moe_intermediate_size * num_shared
-                if (
-                    config.hidden_size % block_k
-                    or shared_intermediate % block_n
-                    or config.hidden_size % block_n
-                    or shared_intermediate % block_k
-                ):
-                    raise ValueError(
-                        f"Shared expert dimensions must divide {weight_block_size=}"
-                    )
-                self.mlp.w1_shared_block_scale = nnx.Param(
-                    jnp.zeros(
-                        (shared_intermediate // block_n, config.hidden_size // block_k),
-                        dtype=jnp.float32,
-                    ),
-                    out_sharding=P(None, None),
-                )
-                self.mlp.w3_shared_block_scale = nnx.Param(
-                    jnp.zeros(
-                        (shared_intermediate // block_n, config.hidden_size // block_k),
-                        dtype=jnp.float32,
-                    ),
-                    out_sharding=P(None, None),
-                )
-                self.mlp.w2_shared_block_scale = nnx.Param(
-                    jnp.zeros(
-                        (config.hidden_size // block_n, shared_intermediate // block_k),
-                        dtype=jnp.float32,
-                    ),
-                    out_sharding=P(None, None),
-                )
-        elif self.moe_backend == MoEBackend.FUSED:
-            self.mlp = FusedEPMoE(
-                **common,
-                renormalize_topk_logits=config.norm_topk_prob,
-                routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
-                use_grouped_topk=getattr(config, "n_group", 1) > 1,
-                num_groups=getattr(config, "n_group", 1),
-                top_k_groups=getattr(config, "topk_group", 1),
-                num_shared_experts=num_shared,
-                moe_shared_expert_intermediate_size=config.moe_intermediate_size,
-                quantization_config=getattr(config, "quantization_config", None),
-            )
-        else:
-            self.mlp = EPMoE(**common, quantization_config=getattr(config, "quantization_config", None))
-        if num_shared > 0 and not self.use_fused:
-            self.shared_experts = Glm5MLP(config.hidden_size,
-                                           config.moe_intermediate_size * num_shared,
-                                           mesh, layer_id, dtype,
-                                           use_fused=getattr(config, "_sgl_use_fused_mlp", False))
-        else:
-            self.shared_experts = None
-        self.is_moe_layer = True
+            build_moe_sublayer(self, config, mesh, layer_id, dtype)
 
     def __call__(self, positions, hidden_states, forward_batch, token_to_kv_pool, recurrent_state_pool,
                  residual=None, dispatch_info=None, dsa_topk_in=None, dsa_topk_pages_in=None):

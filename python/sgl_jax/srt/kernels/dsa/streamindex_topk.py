@@ -648,6 +648,9 @@ _SC_TOPK_VMEM_BUDGET = 0.5
 # owns the whole row.
 _SC_TOPK_COOPERATIVE_ABOVE = 4096
 _SC_TOPK_KEY_VALUE_BYTES = 8  # f32 key + int32 value per candidate
+# Row width above which SparseCore selection is not attempted and the exact
+# two-stage ``_chunked_select`` path is used instead.
+_SPARSECORE_ROW_LIMIT = 131072
 
 
 @functools.lru_cache(maxsize=1)
@@ -741,7 +744,7 @@ def _chunked_select(scores: jax.Array, k: int) -> jax.Array:
     then select from their winners. Neither selector sees the full row width.
     """
     batch, width = scores.shape
-    chunk_width = max(131072, k)
+    chunk_width = max(_SPARSECORE_ROW_LIMIT, k)
     chunks = cdiv(width, chunk_width)
     padded = jnp.pad(scores, ((0, 0), (0, chunks * chunk_width - width)), constant_values=-jnp.inf)
     rows = padded.reshape(batch * chunks, chunk_width)
@@ -760,13 +763,13 @@ def select_topk_indices(scores: jax.Array, k: int, *, backend: str = "auto") -> 
 
     backend: "auto" routes by ``should_use_sc_topk``; "sc" / "xla" force a path.
     "chunked" uses auto routing when the row fits SparseCore, otherwise an
-    exact two-stage selection for rows wider than 131072 entries.
+    exact two-stage selection for rows wider than ``_SPARSECORE_ROW_LIMIT``.
     """
     if scores.shape[-1] < k:
         scores = jnp.pad(scores, ((0, 0), (0, k - scores.shape[-1])), constant_values=-jnp.inf)
     if backend == "chunked":
         fits_sc = sc_topk_available() and should_use_sc_topk(scores.shape[-1], scores.shape[0])
-        if not fits_sc and scores.shape[-1] > max(131072, k):
+        if not fits_sc and scores.shape[-1] > max(_SPARSECORE_ROW_LIMIT, k):
             return _chunked_select(scores, k)
         backend = "auto"
     if backend == "auto":

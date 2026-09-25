@@ -17,7 +17,7 @@ Config facts (zai-org/GLM-5.3-Flash):
   hidden 4096, 45 layers, first_k_dense_replace 3, 288 experts top-8, moe_inter 2048,
   q_lora 1536, kv_lora 512, qk_nope 256, qk_rope 0 (NoPE), v_head 256, heads 64,
   KDA heads 64 head_dim 128 conv_k 4 gate_lower_bound -5.0,
-  index heads 32 head_dim 128 topk 2048 kpool 4, hc_mult 4, swiglu_limit 10.0.
+  index heads 32 head_dim 128 topk 2048 kpool 4, hc_mult 4.
 """
 from __future__ import annotations
 
@@ -49,7 +49,6 @@ class Glm5NextConfig(PretrainedConfig):
         scoring_func: str = "sigmoid",
         first_k_dense_replace: int = 3,
         rms_norm_eps: float = 1e-5,
-        swiglu_limit: float = 10.0,
         # attention layer schedule
         layer_types: list[str] | None = None,
         mlp_layer_types: list[str] | None = None,
@@ -60,7 +59,6 @@ class Glm5NextConfig(PretrainedConfig):
         qk_nope_head_dim: int = 256,
         qk_rope_head_dim: int = 0,
         v_head_dim: int = 256,
-        mla_use_nope: bool = True,
         use_qk_norm: bool = True,
         # KDA
         linear_attn_config: dict[str, Any] | None = None,
@@ -71,9 +69,6 @@ class Glm5NextConfig(PretrainedConfig):
         index_topk: int = 2048,
         index_kpool: int = 4,
         index_kpool_compress: bool = True,
-        index_kpool_always_select_tail: bool = True,
-        indexer_rope_interleave: bool = True,
-        index_share_for_mtp_iteration: bool = True,
         # mHC
         hc_mult: int = 4,
         hc_sinkhorn_iters: int = 20,
@@ -107,7 +102,6 @@ class Glm5NextConfig(PretrainedConfig):
         self.score_function = scoring_func
         self.first_k_dense_replace = first_k_dense_replace
         self.rms_norm_eps = rms_norm_eps
-        self.swiglu_limit = swiglu_limit
 
         # The transformers Glm5NextTextConfig stores these lists verbatim; keep them.
         self.layer_types = list(layer_types or [])
@@ -120,7 +114,6 @@ class Glm5NextConfig(PretrainedConfig):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.v_head_dim = v_head_dim
-        self.mla_use_nope = mla_use_nope
         self.use_qk_norm = use_qk_norm
 
         self.linear_attn_config = linear_attn_config or {
@@ -131,7 +124,6 @@ class Glm5NextConfig(PretrainedConfig):
         }
         # KDAAttnBackend reads a bound off the layer; `RadixLinearAttention` gets `kda_lower_bound`.
         self.kda_lower_bound = kda_lower_bound
-        self.kda_safe_gate = kda_lower_bound is not None
         self.use_kda = True
 
         self.index_n_heads = index_n_heads
@@ -139,9 +131,6 @@ class Glm5NextConfig(PretrainedConfig):
         self.index_topk = index_topk
         self.index_kpool = index_kpool
         self.index_kpool_compress = index_kpool_compress
-        self.index_kpool_always_select_tail = index_kpool_always_select_tail
-        self.indexer_rope_interleave = indexer_rope_interleave
-        self.index_share_for_mtp_iteration = index_share_for_mtp_iteration
 
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
@@ -173,9 +162,6 @@ class Glm5NextConfig(PretrainedConfig):
     def is_kda_layer(self, layer_idx: int) -> bool:
         return str(self._resolved_layer_types[layer_idx]).lower() == "linear_attention"
 
-    def is_full_attention_layer(self, layer_idx: int) -> bool:
-        return not self.is_kda_layer(layer_idx)
-
     @property
     def linear_layer_ids(self) -> list[int]:
         return [i for i in range(self.num_hidden_layers) if self.is_kda_layer(i)]
@@ -183,15 +169,6 @@ class Glm5NextConfig(PretrainedConfig):
     @property
     def full_attention_layer_ids(self) -> list[int]:
         return [i for i in range(self.num_hidden_layers) if not self.is_kda_layer(i)]
-
-    @property
-    def linear_attn_layers(self) -> list[int]:
-        """Alias used by the generic hybrid runner path."""
-        return self.linear_layer_ids
-
-    @property
-    def full_attn_layers(self) -> list[int]:
-        return self.full_attention_layer_ids
 
     @property
     def head_dim(self) -> int:
@@ -276,7 +253,6 @@ def get_glm5_next_config(hf_config: Any) -> Glm5NextConfig | None:
         scoring_func=g("scoring_func", "sigmoid"),
         first_k_dense_replace=g("first_k_dense_replace", 3),
         rms_norm_eps=g("rms_norm_eps", 1e-5),
-        swiglu_limit=g("swiglu_limit", 10.0),
         layer_types=list(g("layer_types", []) or []),
         mlp_layer_types=list(g("mlp_layer_types", []) or []),
         indexer_types=(list(g("indexer_types")) if g("indexer_types") is not None else None),
@@ -285,7 +261,6 @@ def get_glm5_next_config(hf_config: Any) -> Glm5NextConfig | None:
         qk_nope_head_dim=g("qk_nope_head_dim", 256),
         qk_rope_head_dim=g("qk_rope_head_dim", 0),
         v_head_dim=g("v_head_dim", 256),
-        mla_use_nope=g("mla_use_nope", True),
         use_qk_norm=g("use_qk_norm", True),
         linear_attn_config=la,
         kda_lower_bound=la.get("gate_lower_bound", -5.0),
@@ -294,9 +269,6 @@ def get_glm5_next_config(hf_config: Any) -> Glm5NextConfig | None:
         index_topk=g("index_topk", 2048),
         index_kpool=g("index_kpool", 4),
         index_kpool_compress=g("index_kpool_compress", True),
-        index_kpool_always_select_tail=g("index_kpool_always_select_tail", True),
-        indexer_rope_interleave=g("indexer_rope_interleave", True),
-        index_share_for_mtp_iteration=g("index_share_for_mtp_iteration", True),
         hc_mult=g("hc_mult", 4),
         hc_sinkhorn_iters=g("hc_sinkhorn_iters", 20),
         hc_eps=g("hc_eps", 1e-6),

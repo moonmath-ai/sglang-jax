@@ -657,14 +657,8 @@ class ModelRunnerKVCacheMixin:
             **kvcache_kwargs,
         )
 
-    def _validate_kv_pool_compatibility(self: ModelRunner) -> None:
-        """Reject unsupported pool-family combinations before dispatch."""
-        # KDA + DSA sparse hybrids (GLM-5.3-Flash) are supported: the DSA indexer cache is
-        # forwarded through HybridLinearKVPool to the inner MLA pool. Nothing to reject today.
-
     def _init_pools(self: ModelRunner, max_num_reqs: int, dp_size: int):
         """Create ReqToTokenPool, KV pool, allocator, and MemoryPools."""
-        self._validate_kv_pool_compatibility()
 
         from sgl_jax.srt.mem_cache.allocator import (
             PagedTokenToKVPoolAllocator,

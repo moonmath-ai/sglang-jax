@@ -96,8 +96,6 @@ class KimiDeltaAttention(nnx.Module):
         self.conv_size = linear_config["short_conv_kernel_size"]
         self.head_dim = linear_config["head_dim"]
         self.k_head_dim = self.head_dim
-        # `v_head_dim` defaults to the linear head dim. GLM-5.3 uses the SAME field name in its config
-        # for the *MLA* v head dim (256), so the caller must pass the linear head dim explicitly (128).
         self.v_head_dim = v_head_dim or getattr(config, "v_head_dim", None) or self.head_dim
         self.num_heads = linear_config["num_heads"]
         self.num_k_heads = self.num_heads

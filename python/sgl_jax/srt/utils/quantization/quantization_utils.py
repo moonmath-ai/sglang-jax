@@ -152,9 +152,9 @@ def apply_linear_quantization(
             `self_attn.q_conv1d` in the config)
         """
         p = path.replace("/", ".")
-        p = re.sub(r"\.(\d+)\.", r"[\1].", p)          # layers.0. -> layers[0].
-        p = p.replace("language_model.", "")           # GLM-5.3 checkpoint wrapper
-        p = p.replace(".attn.", ".")                   # model's RadixLinearAttention nesting
+        p = re.sub(r"\.(\d+)\.", r"[\1].", p)
+        p = p.replace("language_model.", "")
+        p = p.replace(".attn.", ".")
         # GLM-5.3 mHC: the checkpoint names tensors `hc_attn_fn` (flat); the model nests them
         # as `hc_attn.fn`. Fold the underscore form to the nested form.
         p = re.sub(r"\.hc_(attn|ffn)_(fn|base|scale)", r".hc_\1.\2", p)

@@ -2,9 +2,13 @@
 
 Runs directly on the TPU (no model, no weights). GLM-5.3 shapes: H_I=32, D=128, k=2048,
 page=128. Sweeps decode batch and context length. This is the kernel behind DSA_INDEXER_KERNEL.
+
+From the repository root:
+  PYTHONPATH=python python benchmark/kernels/dsa/bench_indexer_topk.py
 """
-import sys, time
-sys.path.insert(0, "/home/emir/sglang-jax/python")
+from __future__ import annotations
+
+import time
 
 import jax
 import jax.numpy as jnp

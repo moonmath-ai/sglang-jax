@@ -1223,8 +1223,6 @@ class MLATokenToKVPool(KVCache):
     def _aligned_latent_dims(kv_lora_rank: int, qk_rope_head_dim: int) -> tuple[int, int]:
         from sgl_jax.srt.kernels.mla.v2.kernel import align_rope_dim, align_to
 
-        # NoPE models (GLM-5.3-Flash: qk_rope_head_dim == 0) still reserve one aligned block of zeros
-        # so the Pallas block shapes stay valid; the rotation is a no-op on those zeros.
         return align_to(kv_lora_rank, 128), align_rope_dim(qk_rope_head_dim)
 
     @staticmethod
@@ -1633,10 +1631,9 @@ class HybridLinearKVPool(KVCache):
         return self.full_kv_pool.get_fused_kv_buffer(self._to_physical(layer_id))
 
     def get_indexer_key_buffer(self, slot_id: int) -> jax.Array:
-        """DSA indexer-key cache lives on the inner MLA pool.
+        """DSA indexer-key cache on the inner MLA pool.
 
-        `slot_id` is the DSA `full_slot` (indexer-buffer slot), NOT a global layer id, so it is
-        forwarded unchanged. Used by GLM-5.3-Flash (KDA + DSA sparse hybrid).
+        `slot_id` is the DSA `full_slot`, not a global layer id, so it is forwarded unchanged.
         """
         return self.full_kv_pool.get_indexer_key_buffer(slot_id)
 
@@ -1660,9 +1657,8 @@ class HybridLinearKVPool(KVCache):
 
         Differs from SWAKVPool.replace_buffer which expects full-length input —
         KDA layers don't write KV pool, so the model emits a compacted list.
-
-        GLM-5.3-Flash also returns a `(kv_buffer, idx_buffer)` tuple (the DSA indexer cache travels
-        with the latent KV); pass it straight through to the inner MLA pool, which unwraps it.
+        GLM-5.3-Flash additionally returns a `(kv_buffer, idx_buffer)` tuple;
+        pass it through to the inner MLA pool, which unwraps it.
         """
         if isinstance(kv_buffer, tuple):
             kv_part = kv_buffer[0]

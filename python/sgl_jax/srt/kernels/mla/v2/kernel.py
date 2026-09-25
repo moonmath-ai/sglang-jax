@@ -1280,8 +1280,6 @@ def prepare_q_inputs(
     q_packing = get_dtype_packing(q.dtype)
     num_q_heads = align_to(actual_num_q_heads, q_packing)
     head_dim = max(align_to(actual_head_dim, 128), min_dim)
-    # reshape to the explicit width only when nonzero (NoPE: actual_head_dim == 0 is invalid).
-    q = q.reshape(max_num_tokens, actual_num_q_heads, actual_head_dim) if actual_head_dim > 0 else q
     q = jnp.pad(
         q,
         (
@@ -1313,8 +1311,7 @@ def prepare_kv_inputs(kv: jax.Array, min_dim: int = 0):
         kv = jnp.pad(kv, ((0, pad), (0, 0)), constant_values=0)
 
     head_dim = max(align_to(actual_head_dim, 128), min_dim)
-    # Pad the head dim BEFORE the reshape: reshaping to an explicit 0-wide axis is invalid
-    # (NoPE: actual_head_dim == 0), and the pad target (head_dim) is always >= 128 for rope tensors.
+    # Pad the head dim before the reshape: a 0-wide axis (NoPE) cannot be reshaped.
     if head_dim > actual_head_dim:
         kv = jnp.pad(kv, ((0, 0), (0, head_dim - actual_head_dim)), constant_values=0)
     kv = kv.reshape(-1, kv_packing, head_dim)

@@ -8,8 +8,6 @@ context limit. No short-context shortcut is used: every active query is scored.
 
 from __future__ import annotations
 
-import functools
-
 import jax
 import jax.numpy as jnp
 
@@ -29,10 +27,7 @@ def _page_buckets(pages_per_seq: int, pages_per_block: int) -> tuple[int, ...]:
     return tuple(buckets)
 
 
-@functools.partial(
-    jax.jit,
-    static_argnames=("k", "pages_per_seq", "num_kv_pages_per_block"),
-)
+@jax.jit(static_argnames=("k", "pages_per_seq", "num_kv_pages_per_block"))
 def streamindex_topk_live(
     q: jax.Array,
     weights: jax.Array,
@@ -112,6 +107,7 @@ def streamindex_topk_live(
     sorted_buckets = row_buckets[order]
     active_count = jnp.sum(active, dtype=jnp.int32)
 
+    # cu_q_lens is an ignored ABI slot (decode: query i belongs to sequence i).
     one_cuq = jnp.arange(group_size + 1, dtype=jnp.int32)
     one_dist = jnp.asarray([group_size, group_size, group_size], jnp.int32)
     bucket_branches = []

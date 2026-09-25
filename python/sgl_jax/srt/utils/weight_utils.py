@@ -2903,12 +2903,6 @@ class WeightLoader:
                 elif hasattr(current_level, key):
                     current_level = getattr(current_level, key)
                 else:
-                    if os.environ.get("SGLANG_JAX_DEBUG_PARAM", "0") == "1":
-                        try:
-                            avail = list(current_level.keys()) if hasattr(current_level, "keys") else dir(current_level)
-                        except Exception:
-                            avail = "?"
-                        logger.error("param path %s failed at key %r; available: %s", path, key, avail)
                     raise ValueError(f"{path} is not a valid param path")
 
         return cast(nnx.Variable[jax.Array], current_level)
