@@ -124,6 +124,7 @@ class Glm5NextHC(nnx.Module):
 
 class Glm5NextDecoderLayer(nnx.Module):
     def __init__(self, config: Glm5NextConfig, mesh, layer_id: int = 0, dtype=jnp.bfloat16):
+        self.config = config
         self.layer_id = layer_id
         self.is_kda = config.is_kda_layer(layer_id)
         self.hc_mult = config.hc_mult
@@ -188,7 +189,7 @@ class Glm5NextDecoderLayer(nnx.Module):
             self.topk = None
             self.shared_experts = None
         else:
-            build_moe_sublayer(self, config, mesh, layer_id, dtype)
+            build_moe_sublayer(self, config, mesh, layer_id, dtype, use_fused_mlp_default=False)
 
     def __call__(self, positions, hidden_states, forward_batch, token_to_kv_pool, recurrent_state_pool,
                  residual=None, dispatch_info=None, dsa_topk_in=None, dsa_topk_pages_in=None):
@@ -230,7 +231,14 @@ class Glm5NextDecoderLayer(nnx.Module):
             router_logits = self.moe_gate(h)
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
             topk_weights, topk_ids = self.topk(router_logits, correction_bias, dispatch_info=dispatch_info)
-            mlp_out = self.mlp(h, topk_weights, topk_ids)
+            mlp_kwargs = {}
+            # GLM-5.3-Flash MV2 uses a SwiGLU activation clamp on both the routed
+            # and (in-kernel) shared experts. Only the V2 fused kernel supports it.
+            swiglu_limit = getattr(self.config, "swiglu_limit", None)
+            if swiglu_limit is not None and self.moe_backend == MoEBackend.FUSED_V2:
+                mlp_kwargs["swiglu_limit"] = swiglu_limit
+                mlp_kwargs["shared_swiglu_limit"] = swiglu_limit
+            mlp_out = self.mlp(h, topk_weights, topk_ids, **mlp_kwargs)
             if shared_output is not None:
                 mlp_out = mlp_out + shared_output
         else:

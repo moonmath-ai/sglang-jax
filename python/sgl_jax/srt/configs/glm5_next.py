@@ -17,7 +17,7 @@ Config facts (zai-org/GLM-5.3-Flash):
   hidden 4096, 45 layers, first_k_dense_replace 3, 288 experts top-8, moe_inter 2048,
   q_lora 1536, kv_lora 512, qk_nope 256, qk_rope 0 (NoPE), v_head 256, heads 64,
   KDA heads 64 head_dim 128 conv_k 4 gate_lower_bound -5.0,
-  index heads 32 head_dim 128 topk 2048 kpool 4, hc_mult 4.
+  index heads 32 head_dim 128 topk 2048 kpool 4, hc_mult 4, swiglu_limit 10.0.
 """
 from __future__ import annotations
 
@@ -49,6 +49,7 @@ class Glm5NextConfig(PretrainedConfig):
         scoring_func: str = "sigmoid",
         first_k_dense_replace: int = 3,
         rms_norm_eps: float = 1e-5,
+        swiglu_limit: float = 10.0,
         # attention layer schedule
         layer_types: list[str] | None = None,
         mlp_layer_types: list[str] | None = None,
@@ -102,6 +103,7 @@ class Glm5NextConfig(PretrainedConfig):
         self.score_function = scoring_func
         self.first_k_dense_replace = first_k_dense_replace
         self.rms_norm_eps = rms_norm_eps
+        self.swiglu_limit = swiglu_limit
 
         # The transformers Glm5NextTextConfig stores these lists verbatim; keep them.
         self.layer_types = list(layer_types or [])
@@ -253,6 +255,7 @@ def get_glm5_next_config(hf_config: Any) -> Glm5NextConfig | None:
         scoring_func=g("scoring_func", "sigmoid"),
         first_k_dense_replace=g("first_k_dense_replace", 3),
         rms_norm_eps=g("rms_norm_eps", 1e-5),
+        swiglu_limit=g("swiglu_limit", 10.0),
         layer_types=list(g("layer_types", []) or []),
         mlp_layer_types=list(g("mlp_layer_types", []) or []),
         indexer_types=(list(g("indexer_types")) if g("indexer_types") is not None else None),

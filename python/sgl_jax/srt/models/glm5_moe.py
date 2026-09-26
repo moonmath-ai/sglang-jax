@@ -820,13 +820,25 @@ class Glm5MLP(nnx.Module):
         return output
 
 
-def build_moe_sublayer(module: nnx.Module, config, mesh, layer_id: int, dtype) -> None:
+def build_moe_sublayer(
+    module: nnx.Module,
+    config,
+    mesh,
+    layer_id: int,
+    dtype,
+    use_fused_mlp_default: bool = True,
+) -> None:
     """Build the MoE gate/top-k/experts on ``module`` (GLM-5.x decoder layers).
 
     Shared by ``Glm5DecoderLayer`` and ``Glm5NextDecoderLayer`` so the fused,
     fused-v2, and EPMoE construction (incl. static-FP8 shared-expert scales)
     lives in one place. Sets ``moe_gate``, ``moe_backend``, ``use_fused``,
     ``topk``, ``mlp``, ``shared_experts``, and ``is_moe_layer``.
+
+    ``use_fused_mlp_default`` is the fallback for the non-fused shared-expert
+    MLP when ``config._sgl_use_fused_mlp`` is unset. The two decoder layers
+    historically disagreed (GLM-5.2 default True, GLM-5.3 default False), so
+    each caller passes its own to preserve behavior if the attribute is absent.
     """
     router_dtype = jnp.float32
     module.moe_gate = GateLogit(
@@ -962,7 +974,7 @@ def build_moe_sublayer(module: nnx.Module, config, mesh, layer_id: int, dtype) -
             layer_id=layer_id,
             dtype=dtype,
             mesh=mesh,
-            use_fused=getattr(config, "_sgl_use_fused_mlp", True),
+            use_fused=getattr(config, "_sgl_use_fused_mlp", use_fused_mlp_default),
         )
     else:
         module.shared_experts = None
@@ -977,6 +989,7 @@ class Glm5DecoderLayer(nnx.Module):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
+        self.config = config
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         rope_params = getattr(config, "rope_parameters", None) or {}
@@ -1033,7 +1046,7 @@ class Glm5DecoderLayer(nnx.Module):
             self.is_moe_layer = False
             self.moe_gate = None
         else:
-            build_moe_sublayer(self, config, mesh, layer_id, dtype)
+            build_moe_sublayer(self, config, mesh, layer_id, dtype, use_fused_mlp_default=True)
 
         self.input_layernorm = RMSNorm(
             config.hidden_size,
@@ -1093,7 +1106,14 @@ class Glm5DecoderLayer(nnx.Module):
                 dispatch_info=dispatch_info,
             )
 
-            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+            mlp_kwargs = {}
+            # SwiGLU activation clamp (GLM-5.3-Flash). Only the V2 fused kernel
+            # supports it; GLM-5.2 configs leave `swiglu_limit` unset.
+            swiglu_limit = getattr(self.config, "swiglu_limit", None)
+            if swiglu_limit is not None and self.moe_backend == MoEBackend.FUSED_V2:
+                mlp_kwargs["swiglu_limit"] = swiglu_limit
+                mlp_kwargs["shared_swiglu_limit"] = swiglu_limit
+            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids, **mlp_kwargs)
 
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output

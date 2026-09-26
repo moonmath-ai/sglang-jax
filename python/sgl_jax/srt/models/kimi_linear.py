@@ -324,7 +324,7 @@ class KimiDecoderLayer(nnx.Module):
                 layer_id=layer_idx,
                 dtype=dtype,
                 use_absorbed=getattr(config, "use_absorbed_mla", True),
-                skip_rope=config.mla_use_nope,
+                skip_rope=getattr(config, "mla_use_nope", False),
             )
 
         # FFN
