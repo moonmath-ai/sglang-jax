@@ -339,6 +339,9 @@ def sparse_mla_page_level(
         "kv_lora_rank",
         "k_pages_max",
         "vmem_limit_bytes",
+        "num_kv_pages_per_block",
+        "num_queries_per_block",
+        "mask_pages",
     ),
 )
 def sparse_mla_chain_request_level(
@@ -358,6 +361,9 @@ def sparse_mla_chain_request_level(
     kv_lora_rank: int,
     k_pages_max: int = 512,
     vmem_limit_bytes: int | None = None,
+    num_kv_pages_per_block=None,
+    num_queries_per_block=None,
+    mask_pages: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Page-level sparse MLA for speculative chains, one causal ``Tq``-query pass per request.
 
@@ -384,14 +390,32 @@ def sparse_mla_chain_request_level(
     n_chain_pages = last_chain_page - first_chain_page + 1  # 1 or 2
 
     hits = topk_pages.reshape(B, -1)
-    ok = (hits >= 0) & (hits < first_chain_page[:, None])
-    hits = jnp.sort(jnp.where(ok, hits, big), axis=-1)
-    uniq = jnp.concatenate(
-        [hits[:, :1] < big, (hits[:, 1:] != hits[:, :-1]) & (hits[:, 1:] < big)], axis=-1
-    )
-    # Compact the unique pages to the front (ascending); cap leaves room for the chain pages.
-    n_hit = jnp.minimum(jnp.sum(uniq, axis=-1), k_pages_max - 2)
-    hit_pages = jnp.sort(jnp.where(uniq, hits, big), axis=-1)[:, : k_pages_max - 2]
+    mp = pps if mask_pages is None else min(mask_pages, pps)
+
+    def _sorted():
+        ok = (hits >= 0) & (hits < first_chain_page[:, None])
+        h = jnp.sort(jnp.where(ok, hits, big), axis=-1)
+        uniq = jnp.concatenate(
+            [h[:, :1] < big, (h[:, 1:] != h[:, :-1]) & (h[:, 1:] < big)], axis=-1
+        )
+        # Compact the unique pages to the front (ascending); cap leaves room for the chain pages.
+        n = jnp.minimum(jnp.sum(uniq, axis=-1), k_pages_max - 2).astype(jnp.int32)
+        hp = jnp.sort(jnp.where(uniq, h, big), axis=-1)[:, : k_pages_max - 2]
+        return hp, n
+
+    if mp <= k_pages_max - 2:
+        # Union of the chain tokens' hit pages as an OR of page masks, then an mp-wide
+        # compaction (no sort over Tq * k selected pages). Runtime guard: a sequence
+        # longer than mp pages takes the sort path.
+        def _masked():
+            mask = pages_to_mask(hits, mp)
+            mask &= jnp.arange(mp)[None, :] < first_chain_page[:, None]
+            return page_mask_to_list(mask, k_pages_max - 2)
+
+        fits = jnp.max((req_seq_lens + page_size - 1) // page_size) <= mp
+        hit_pages, n_hit = jax.lax.cond(fits, _masked, _sorted)
+    else:
+        hit_pages, n_hit = _sorted()
 
     col = jnp.arange(k_pages_max)[None, :]
     chain_col = col - n_hit[:, None]  # 0 / 1 -> first / second chain page
@@ -430,6 +454,8 @@ def sparse_mla_chain_request_level(
         sm_scale=sm_scale,
         sliding_window=None,
         soft_cap=None,
+        num_kv_pages_per_block=num_kv_pages_per_block,
+        num_queries_per_block=num_queries_per_block,
         vmem_limit_bytes=vmem_limit_bytes,
     )
     return o[..., :kv_lora_rank], cache_out

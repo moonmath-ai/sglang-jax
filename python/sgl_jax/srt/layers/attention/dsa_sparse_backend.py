@@ -953,6 +953,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 queries_per_seq=Tq,
                 kv_lora_rank=self.kv_lora_rank,
                 k_pages_max=512,
+                mask_pages=self._mask_pages(req_pi_.shape[0] // req_seq_.shape[0]),
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
