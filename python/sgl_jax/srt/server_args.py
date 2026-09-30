@@ -2118,6 +2118,8 @@ class ServerArgs:
                 self.speculative_algorithm == "NEXTN"
                 and self.speculative_eagle_topk == 1
                 and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
+                # the fused NEXTN overlap path builds FlashAttention metadata
+                and self.attention_backend == "fa"
             )
             supports_eagle3_overlap = (
                 self.speculative_algorithm == "EAGLE3"
@@ -2132,7 +2134,7 @@ class ServerArgs:
             if not (supports_nextn_overlap or supports_eagle3_overlap or supports_dflash_overlap):
                 raise ValueError(
                     "Speculative overlap scheduler only supports DFLASH/DSPARK, EAGLE3+FA, "
-                    "or NEXTN with --speculative-eagle-topk=1 and "
+                    "or NEXTN+FA with --speculative-eagle-topk=1 and "
                     "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
                     "Please pass --disable-overlap-schedule for other speculative configs."
                 )

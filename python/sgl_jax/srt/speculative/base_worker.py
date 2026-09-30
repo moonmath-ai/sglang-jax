@@ -90,7 +90,13 @@ class BaseSpecWorker:
             and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
         )
         self._can_use_fused_spec_decode = (
-            self.speculative_algorithm.is_nextn() and can_use_linear_fused_verify
+            self.speculative_algorithm.is_nextn()
+            and can_use_linear_fused_verify
+            # draft_extend_fused drives one runner per MTP layer (MultiLayerDraftWorker)
+            # and builds FlashAttention metadata; single-block MTP drafts (e.g. GLM-5.3)
+            # and MLA/DSA targets take the generic draft/verify/draft-extend loop.
+            and hasattr(draft_worker, "_workers")
+            and server_args.attention_backend == "fa"
         )
         self._can_use_fused_eagle3_verify = (
             self.speculative_algorithm.is_eagle3()
