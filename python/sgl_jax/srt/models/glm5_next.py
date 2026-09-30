@@ -138,20 +138,24 @@ class Glm5NextHC(nnx.Module):
 
 
 class Glm5NextDecoderLayer(nnx.Module):
+    # The MTP draft's layer (glm5_next_mtp.py) is a plain pre-norm residual block without mHC.
+    use_mhc = True
+
     def __init__(self, config: Glm5NextConfig, mesh, layer_id: int = 0, dtype=jnp.bfloat16):
         self.layer_id = layer_id
         self.is_kda = config.is_kda_layer(layer_id)
         self.swiglu_limit = config.swiglu_limit
 
-        hc_args = (
-            config.hidden_size,
-            config.hc_mult,
-            config.hc_sinkhorn_iters,
-            config.hc_eps,
-            config.rms_norm_eps,
-        )
-        self.hc_attn = Glm5NextHC(*hc_args, mesh, dtype)
-        self.hc_ffn = Glm5NextHC(*hc_args, mesh, dtype)
+        if self.use_mhc:
+            hc_args = (
+                config.hidden_size,
+                config.hc_mult,
+                config.hc_sinkhorn_iters,
+                config.hc_eps,
+                config.rms_norm_eps,
+            )
+            self.hc_attn = Glm5NextHC(*hc_args, mesh, dtype)
+            self.hc_ffn = Glm5NextHC(*hc_args, mesh, dtype)
 
         # attention
         if self.is_kda:
@@ -510,6 +514,11 @@ class Glm5NextForConditionalGeneration(nnx.Module):
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    def get_embed_and_head(self):
+        """Shared with the MTP draft (`Glm5NextForCausalLMNextN.set_embed_and_head`)."""
+        head = self.model.embed_tokens if self.config.tie_word_embeddings else self.lm_head
+        return self.model.embed_tokens.embedding.value, head.embedding.value
 
 
 EntryClass = [Glm5NextForConditionalGeneration]

@@ -2,6 +2,7 @@ import copy
 import json
 import logging
 import os
+import re
 from enum import Enum, IntEnum, auto
 
 import jax.numpy as jnp
@@ -54,6 +55,7 @@ _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
         "MiMoV2FlashForCausalLM",
         "GlmMoeDsaForCausalLM",
         "Glm5NextForConditionalGeneration",
+        "Glm5NextForCausalLMNextN",
     }
 )
 
@@ -301,6 +303,8 @@ class ModelConfig:
                 ignored = list(self.quantization_config.ignored_layers or [])
                 ignored.extend(["model.eh_proj", "model.mtp_block.self_attn.o_proj"])
                 self.quantization_config.ignored_layers = ignored
+        if self.hf_config.architectures[0] == "Glm5NextForConditionalGeneration":
+            self._patch_glm5_next_nextn_draft_config()
 
     def _derive_context_length(self, context_length: int | None) -> None:
         # Derive context length
@@ -378,6 +382,55 @@ class ModelConfig:
         ):
             hf_quant_config = hf_quant_config.to_dict()
         return hf_quant_config
+
+    def _patch_glm5_next_nextn_draft_config(self) -> None:
+        """Turn a GLM-5.3-Flash target config into its single-layer MTP draft config.
+
+        The MTP block (checkpoint layer ``num_hidden_layers``) is a plain DSA + MoE decoder
+        layer: no KDA, no mHC. The draft runner therefore sees a 1-layer, DSA-only, all-MoE
+        model so the KV pool, indexer cache and DSA backend are sized for exactly one layer,
+        and the hybrid-recurrent plumbing stays off (``_sgl_is_nextn_draft``).
+        """
+        text = self.hf_text_config
+        self.hf_config.architectures[0] = "Glm5NextForCausalLMNextN"
+        mtp_layer_id = int(text.num_hidden_layers)
+        for cfg in {id(self.hf_config): self.hf_config, id(text): text}.values():
+            cfg._sgl_is_nextn_draft = True
+        text._sgl_mtp_layer_id = mtp_layer_id
+        text.num_hidden_layers = 1
+        text.layer_types = ["deepseek_sparse_attention"]
+        text.mlp_layer_types = ["sparse"]
+        text.indexer_types = ["full"]
+        text.first_k_dense_replace = 0
+        text.hc_mult = 1
+        la = dict(getattr(text, "linear_attn_config", None) or {})
+        if la:
+            la["kda_layers"] = []
+            la["full_attn_layers"] = [0]
+            text.linear_attn_config = la
+
+        if self.quantization_config is not None and self.quantization_config.ignored_layers:
+            # Keep only the MTP layer's bf16 modules, renamed to the draft module tree:
+            # `model.layers.<mtp>.{eh_proj,enorm,hnorm,shared_head.norm}` -> `model.*`,
+            # everything else in that layer -> `model.layers.0.*`. Entries of other decoder
+            # layers must go: target layer 0 is KDA, and its ignores (e.g. `o_proj`) would
+            # otherwise un-quantize the draft's FP8 DSA projections.
+            layer_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+            src = f"layers.{mtp_layer_id}."
+            ignored = []
+            for name in self.quantization_config.ignored_layers:
+                m = layer_re.search(name)
+                if m is None:
+                    ignored.append(name)
+                    continue
+                if int(m.group(1)) != mtp_layer_id:
+                    continue
+                tail = name.split(src, 1)[1]
+                if tail.split(".")[0] in ("eh_proj", "enorm", "hnorm", "shared_head"):
+                    ignored.append(f"model.{tail}")
+                else:
+                    ignored.append(f"model.layers.0.{tail}")
+            self.quantization_config.ignored_layers = ignored
 
     def _resolve_quantization_config(self) -> QuantizationConfig | None:
         """Resolve and unify quantization config from multiple sources.

@@ -175,12 +175,16 @@ _FIELDS = tuple(
 )
 
 
-def get_glm5_next_config(hf_config: Any) -> Glm5NextConfig | None:
+def get_glm5_next_config(hf_config: Any, force: bool = False) -> Glm5NextConfig | None:
     """Return a normalized Glm5NextConfig for an HF glm5_next config, else None.
 
     ``hf_config`` is the checkpoint root config (``text_config`` nested) or the text
     config itself; fields it leaves unset keep the Glm5NextConfig defaults.
     """
+    # The MTP draft (see ModelConfig._patch_glm5_next_nextn_draft_config) is a plain DSA + MoE
+    # model: keep it out of the hybrid-recurrent (KDA) plumbing unless forced.
+    if getattr(hf_config, "_sgl_is_nextn_draft", False) and not force:
+        return None
     model_type = getattr(hf_config, "model_type", None)
     archs = getattr(hf_config, "architectures", None) or []
     if model_type not in ("glm5_next", "glm5_next_text") and not any(
