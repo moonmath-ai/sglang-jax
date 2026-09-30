@@ -274,13 +274,23 @@ def streamindex_topk_live_multiq(
 
     group_cuq = jnp.arange(group_size + 1, dtype=jnp.int32) * Tq
     group_dist = jnp.asarray([0, 0, group_size], jnp.int32)  # all mixed: Tq queries per seq
+    # Pad by the largest window so every row slice stays in bounds without shifting (the
+    # old per-element clamp only ever affected pages past a row's live length).
+    padded_pages = jnp.concatenate(
+        [page_indices, jnp.full((buckets[-1],), page_indices[-1], page_indices.dtype)]
+    )
     bucket_branches = []
     for bucket_pages in buckets:
         def score_and_select(args, bucket_pages=bucket_pages):
             q_group, w_group, lengths_group, starts_group, group_order, out = args
-            offsets = starts_group[:, None] + jnp.arange(bucket_pages, dtype=jnp.int32)[None, :]
-            offsets = jnp.minimum(offsets, page_indices.shape[0] - 1)
-            pages = page_indices[offsets].reshape(-1)
+            # Contiguous per-row windows of the (padded) page table: dynamic slices are
+            # cheap DMAs, while a dynamic gather of a few hundred ids costs ~20 us on TPU.
+            pages = jnp.concatenate(
+                [
+                    jax.lax.dynamic_slice_in_dim(padded_pages, starts_group[i], bucket_pages)
+                    for i in range(group_size)
+                ]
+            )
             selected = streamindex_topk(
                 q_group.reshape(group_size * Tq, *q_group.shape[2:]),
                 w_group.reshape(group_size * Tq, w_group.shape[-1]),
