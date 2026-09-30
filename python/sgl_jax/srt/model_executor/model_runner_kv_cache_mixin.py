@@ -243,6 +243,7 @@ def _build_hybrid_pools(
     state_size: int | None = None,
     enable_recurrent_extra_buffer: bool = False,
     ping_pong_slots: int = 2,
+    spec_num_draft_tokens: int = 0,
 ) -> tuple:
     """Build RecurrentStatePool + HybridReqToTokenPool + MemoryPools.
 
@@ -273,6 +274,7 @@ def _build_hybrid_pools(
         conv_dtype=state_params.dtype.conv,
         num_k_heads=state_params.num_k_heads,
         head_k_dim=state_params.head_k_dim,
+        spec_num_draft_tokens=spec_num_draft_tokens,
     )
     hybrid_pool = HybridReqToTokenPool(
         size=max_num_reqs,
@@ -869,6 +871,12 @@ class ModelRunnerKVCacheMixin:
                 state_size=state_size,
                 enable_recurrent_extra_buffer=self.server_args.enable_recurrent_extra_buffer,
                 ping_pong_slots=_recurrent_ping_pong_slots(self.server_args),
+                spec_num_draft_tokens=(
+                    self.server_args.speculative_num_draft_tokens
+                    if self.server_args.speculative_algorithm is not None
+                    and not self.is_draft_worker
+                    else 0
+                ),
             )
         else:
             self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)

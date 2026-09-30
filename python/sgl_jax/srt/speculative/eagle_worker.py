@@ -123,6 +123,9 @@ class EAGLEWorker(BaseSpecWorker):
             dp_size,
         )
 
+        target_pools = self.target_worker.model_runner.memory_pools
+        target_is_hybrid = target_pools._pools.get("recurrent_state_pool") is not None
+        hidden_dtype = self.target_worker.model_config.dtype
         # One (bs, cache_loc) shape per bs bucket, or every rung of the bucket
         # when the fitted spec cache_loc padding is on (the runtime fit may
         # only land on those rungs, so this precompile covers all of them).
@@ -188,6 +191,10 @@ class EAGLEWorker(BaseSpecWorker):
                                 np.full(pad_len, -1, dtype=np.int32),
                             ]
                         )
+                    if target_is_hybrid:
+                        # Dummy slot 0 on every row: verify scratch/commit writes are skipped.
+                        batch.recurrent_indices = np.zeros(bs, dtype=np.int32)
+                        batch.has_initial_state = np.ones(bs, dtype=np.bool_)
                     return batch
 
                 model_worker_batch = _make_decode_batch()
@@ -213,9 +220,7 @@ class EAGLEWorker(BaseSpecWorker):
                     topk_index=jax.device_put(np.ones(topk_shape, dtype=np.int32), data_sharding),
                     hidden_states=np.ones(
                         (bs, self.draft_worker.model_config.hidden_size),
-                        dtype=(
-                            jnp.bfloat16 if self.server_args.dtype == "bfloat16" else np.float32
-                        ),
+                        dtype=hidden_dtype,
                     ),
                     verified_id=jax.device_put(np.ones((bs,), dtype=np.int32), data_sharding),
                     capture_hidden_mode=CaptureHiddenMode.FULL,

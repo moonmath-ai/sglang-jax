@@ -2881,6 +2881,16 @@ class ScheduleBatch:
             tree_cache=self.tree_cache,
             mrope_positions=None,
         )
+        if self.is_hybrid_recurrent:
+            # Target verify of a hybrid model reads/commits each request's running
+            # recurrent slot. Padding rows keep the reserved dummy slot 0.
+            sel = np.asarray(logits_indices_selector)
+            recurrent_indices = np.zeros(total_bs, dtype=np.int32)
+            recurrent_indices[sel] = self.req_to_token_pool.get_linear_recurrent_indices(
+                np.asarray(req_pool_indices_cpu)[sel]
+            )
+            model_worker_batch.recurrent_indices = recurrent_indices
+            model_worker_batch.has_initial_state = np.ones(total_bs, dtype=np.bool_)
         return model_worker_batch
 
     @staticmethod

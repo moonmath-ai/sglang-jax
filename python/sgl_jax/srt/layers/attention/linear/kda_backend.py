@@ -67,6 +67,12 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         ), f"unequal Q/K/V proj widths: {q_conv_w.shape[0]}/{k_conv_w.shape[0]}/{v_conv_w.shape[0]}"
         q_state, k_state, v_state = self._unpack_conv_states(conv_states)
 
+        if forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            return self._forward_target_verify(
+                q, k, v, a, b, layer, recurrent_state_pool, recurrent_indices,
+                ssm_states, (q_state, k_state, v_state), (q_conv_w, k_conv_w, v_conv_w),
+            )
+
         cu_q_lens = self.forward_metadata.cu_q_lens
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             q, q_state_new = self._short_conv_extend(
@@ -170,9 +176,10 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             recurrent_state_pool,
             layer_id,
         )
-        assert len(conv_buffer_list) == 1, (
-            f"KDA expects exactly 1 conv buffer per layer "
-            f"(reserved RecurrentStatePool inner-list length); got {len(conv_buffer_list)}"
+        # [conv] or [conv, spec_conv, spec_ssm] (speculative verify scratch).
+        assert len(conv_buffer_list) in (1, 3), (
+            f"KDA expects 1 conv buffer (+2 speculative scratch) per layer; "
+            f"got {len(conv_buffer_list)}"
         )
         conv_buffer = conv_buffer_list[0]
 
@@ -227,7 +234,6 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
     def set_conv_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_conv_packed):
         """Scatter per-request packed conv state. Same idx==0 guard as set_ssm_state."""
         _, conv_buffer_list = self.get_layer_cache(recurrent_state_pool, layer_id)
-        assert len(conv_buffer_list) == 1
         full_conv = conv_buffer_list[0]
 
         def _scatter(buf, idx, val):
@@ -246,7 +252,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             out_specs=P("data", "tensor", None),
             check_vma=False,
         )(full_conv, recurrent_indices, new_conv_packed)
-        return [new_conv_full]
+        return [new_conv_full] + list(conv_buffer_list[1:])
 
     def set_ssm_track_state(self, full_recurrent, track_indices, track_mask, new_recurrent):
         """Scatter ``new_recurrent`` into the request track slots.
@@ -301,7 +307,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             out_specs=P("data", "tensor", None),
             check_vma=False,
         )(full_conv, track_indices, track_mask, new_conv_packed)
-        return [jax.lax.optimization_barrier(new_full)]
+        return [jax.lax.optimization_barrier(new_full)] + list(new_conv_full_list[1:])
 
     # ------------------------------------------------------------------
     # Forward mode implementations
@@ -500,6 +506,140 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             check_vma=False,
         )
         return sharded(q, k, v, g, beta, initial_state)
+
+    @named_scope("kda_target_verify")
+    def _forward_target_verify(
+        self, q, k, v, a, b, layer, recurrent_state_pool, recurrent_indices,
+        ssm_states, conv_states, conv_weights,
+    ):
+        """Speculative target verify over a topk=1 chain of T tokens per request.
+
+        Tokens are request-major (``[bs * T]``). Runs the DECODE conv and recurrence one
+        chain step at a time -- so each token sees exactly the numerics of plain decode --
+        and records the state after every step in the pool's verify scratch. The running
+        state is NOT advanced here; ``RecurrentStatePool.commit_speculative_state`` picks
+        the step of the accepted length once verification is done.
+        """
+        ssm_full, conv_list = self.get_layer_cache(recurrent_state_pool, layer.layer_id)
+        assert len(conv_list) == 3, (
+            "TARGET_VERIFY needs the recurrent pool's speculative scratch "
+            "(RecurrentStatePool(spec_num_draft_tokens=...))"
+        )
+        conv_full, spec_conv_full, spec_ssm_full = conv_list
+
+        bs = ssm_states.shape[0]
+        T = q.shape[0] // bs
+        assert T * bs == q.shape[0], (q.shape, bs)
+
+        def _conv_chain_local(x, w, cache):
+            # x [B*T, D], cache [B, D, K-1] (per-shard); DECODE conv one chain step at a time.
+            B = cache.shape[0]
+            x = x.reshape(B, T, x.shape[-1])
+            ys, caches = [], []
+            for t in range(T):
+                y, cache = short_convolution(
+                    x[:, t], w, cache, None, ForwardMode.DECODE, activation=layer.activation
+                )
+                ys.append(y)
+                caches.append(cache)
+            return jnp.stack(ys, axis=1).reshape(B * T, -1), jnp.stack(caches, axis=1)
+
+        conv_chain = jax.shard_map(
+            _conv_chain_local,
+            mesh=self.mesh,
+            in_specs=(P("data", "tensor"), P("tensor", None), P("data", "tensor", None)),
+            out_specs=(P("data", "tensor"), P("data", None, "tensor", None)),
+            check_vma=False,
+        )
+        (q_state, k_state, v_state), (q_w, k_w, v_w) = conv_states, conv_weights
+        q, q_caches = conv_chain(q, q_w, q_state)
+        k, k_caches = conv_chain(k, k_w, k_state)
+        v, v_caches = conv_chain(v, v_w, v_state)
+        # [bs, T, proj, K-1]: packed conv state after each chain step (per-shard [q|k|v])
+        spec_conv_spec = P("data", None, "tensor", None)
+        step_conv = jax.shard_map(
+            lambda a_, b_, c_: jnp.concatenate([a_, b_, c_], axis=2),
+            mesh=self.mesh,
+            in_specs=(spec_conv_spec,) * 3,
+            out_specs=spec_conv_spec,
+            check_vma=False,
+        )(q_caches, k_caches, v_caches)
+
+        q = l2_normalize(q.reshape(bs * T, layer.num_q_heads, layer.head_q_dim))
+        k = l2_normalize(k.reshape(bs * T, layer.num_k_heads, layer.head_k_dim))
+        v = v.reshape(bs * T, layer.num_v_heads, layer.head_v_dim)
+        g = self._fused_kda_gate(layer, a.reshape(bs * T, layer.num_q_heads, layer.head_q_dim))
+        beta = b.reshape(bs * T, layer.num_q_heads)
+        scale = layer.scale
+
+        def _chain_kernel(q_d, k_d, v_d, g_d, beta_d, h0):
+            # [B*T, H, *] -> [B, T, H, *]
+            B = h0.shape[0]
+            q_d, k_d, v_d, g_d = (x.reshape(B, T, *x.shape[1:]) for x in (q_d, k_d, v_d, g_d))
+            beta_d = beta_d.reshape(B, T, -1)
+            h = h0
+            outs, states = [], []
+            for t in range(T):
+                o, h = naive_recurrent_kda(
+                    q_d[:, t : t + 1],
+                    k_d[:, t : t + 1],
+                    v_d[:, t : t + 1],
+                    g_d[:, t : t + 1],
+                    beta_d[:, t : t + 1],
+                    scale=scale,
+                    initial_state=h,
+                    output_final_state=True,
+                )
+                h = h.astype(h0.dtype)
+                outs.append(o[:, 0])
+                states.append(h)
+            o = jnp.stack(outs, axis=1)
+            return o.reshape(B * T, *o.shape[2:]), jnp.stack(states, axis=1)
+
+        output, step_ssm = jax.shard_map(
+            _chain_kernel,
+            mesh=self.mesh,
+            in_specs=(
+                P("data", "tensor", None),  # q [B*T, H, K]
+                P("data", "tensor", None),  # k
+                P("data", "tensor", None),  # v
+                P("data", "tensor", None),  # g
+                P("data", "tensor"),  # beta [B*T, H]
+                P("data", "tensor", None, None),  # h0 [B, H, K, V]
+            ),
+            out_specs=(
+                P("data", "tensor", None),  # o [B*T, H, V]
+                P("data", None, "tensor", None, None),  # states [B, T, H, K, V]
+            ),
+            check_vma=False,
+        )(q, k, v, g, beta, ssm_states)
+
+        # Scratch rows are batch positions, not recurrent slots: one contiguous write per
+        # layer instead of a gather + scatter. The commit maps row b -> slot idx[b].
+        def _write_rows(buf, val):
+            assert val.shape[0] <= buf.shape[0], (val.shape, buf.shape)
+            return jax.lax.dynamic_update_slice_in_dim(buf, val.astype(buf.dtype), 0, axis=0)
+
+        spec_ssm_spec = P("data", None, "tensor", None, None)
+        new_spec_conv = jax.shard_map(
+            _write_rows,
+            mesh=self.mesh,
+            in_specs=(spec_conv_spec, spec_conv_spec),
+            out_specs=spec_conv_spec,
+            check_vma=False,
+        )(spec_conv_full, step_conv)
+        new_spec_ssm = jax.shard_map(
+            _write_rows,
+            mesh=self.mesh,
+            in_specs=(spec_ssm_spec, spec_ssm_spec),
+            out_specs=spec_ssm_spec,
+            check_vma=False,
+        )(spec_ssm_full, step_ssm)
+
+        return output.reshape(output.shape[0], -1), (
+            ssm_full,
+            [conv_full, new_spec_conv, new_spec_ssm],
+        )
 
     def _fused_kda_gate(
         self,

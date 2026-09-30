@@ -506,6 +506,11 @@ class EagleDraftWorker(BaseDraftWorker):
         spec_info_padded = model_worker_batch.spec_info_padded
         spec_info_padded.verified_id = _dp_segment_pad(spec_info_padded.verified_id, bs)
         spec_info_padded.topk_p = _dp_segment_pad(spec_info_padded.topk_p, bs)
+        for field in ("recurrent_indices", "has_initial_state"):
+            # Hybrid targets: keep per-request recurrent metadata aligned with seq_lens.
+            arr = getattr(model_worker_batch, field, None)
+            if arr is not None and len(arr) < bs:
+                setattr(model_worker_batch, field, _dp_segment_pad(np.asarray(arr), bs))
         if bs - model_worker_batch.seq_lens.shape[0] > 0:
             model_worker_batch.seq_lens = _dp_segment_pad(model_worker_batch.seq_lens, bs)
             if spec_info_padded.allocate_lens is not None:

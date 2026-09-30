@@ -362,6 +362,26 @@ class BaseSpecWorker:
             model_worker_batch.seq_lens,
         )
 
+    def _commit_recurrent_state_after_verify(self, model_worker_batch, accept_length):
+        """Hybrid (KDA/GDN) targets: TARGET_VERIFY only recorded per-step recurrent states;
+        advance each request's running state by exactly its accepted length."""
+        pools = self.target_worker.model_runner.memory_pools
+        rsp = pools._pools.get("recurrent_state_pool")
+        if rsp is None:
+            return
+        recurrent_indices = model_worker_batch.recurrent_indices
+        assert recurrent_indices is not None, "hybrid target verify needs recurrent_indices"
+        sharding = NamedSharding(self.mesh, P("data"))
+        idx, acc = jax.device_put(
+            (
+                np.asarray(recurrent_indices, dtype=np.int32),
+                np.asarray(accept_length, dtype=np.int32).reshape(-1),
+            ),
+            sharding,
+        )
+        with jax.set_mesh(self.mesh):
+            rsp.commit_speculative_state(idx, acc)
+
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
         from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -392,6 +412,7 @@ class BaseSpecWorker:
             self.draft_worker.draft_model_runner.rngs,
             self.mesh,
         )
+        self._commit_recurrent_state_after_verify(model_worker_batch, accept_length)
         legacy_non_overlap = use_legacy_eagle3_non_overlap(
             not self.server_args.disable_overlap_schedule,
             getattr(model_worker_batch, "spec_algorithm", None),

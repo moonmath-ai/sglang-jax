@@ -93,11 +93,21 @@ class RecurrentStatePool:
         num_k_heads: int | None = None,
         head_k_dim: int | None = None,
         abstract: bool = False,
+        spec_num_draft_tokens: int = 0,
     ):
         """`size` is the **global** number of valid slots across all DP ranks
         (mirrors MHATokenToKVPool.size semantics). Internally we partition by
         DP: each rank gets `size // dp_size` valid slots + 1 dummy slot at
         index 0, so total buffer slots = size + dp_size.
+
+        ``spec_num_draft_tokens > 0`` (speculative decoding, topk == 1 chain) adds per-slot
+        verify scratch to every layer: target verify writes the state after each of its
+        ``spec_num_draft_tokens`` tokens there instead of advancing the running state, and
+        :meth:`commit_speculative_state` then keeps the step matching the accepted length.
+        Scratch rows are *batch positions* of the verify batch (``total_slots`` rows bound
+        the verify batch size). It rides in the layer's conv list as
+        ``[conv, spec_conv [rows, T, proj, K-1], spec_ssm [rows, T, H, K, V]]`` so the model
+        and backends pass it through untouched.
         """
         state_dtype = recurrent_state_dtype()
         if temporal_dtype is None:
@@ -166,6 +176,7 @@ class RecurrentStatePool:
             mesh, P(data_partition_axis, recurrent_partition_axis, None, None)
         )
         self.conv_sharding = NamedSharding(mesh, P(data_partition_axis, conv_partition_axis, None))
+        self.spec_num_draft_tokens = spec_num_draft_tokens
 
         self.recurrent_buffers, self.conv_buffers = self._create_buffers(abstract=abstract)
 
@@ -176,6 +187,21 @@ class RecurrentStatePool:
         conv_dtype = self.conv_dtype
 
         if abstract:
+            conv_inner = [jax.ShapeDtypeStruct(conv_shape, conv_dtype, sharding=self.conv_sharding)]
+            if self.spec_num_draft_tokens > 0:
+                T = self.spec_num_draft_tokens
+                conv_inner += [
+                    jax.ShapeDtypeStruct(
+                        (self.total_slots, T) + conv_shape[1:],
+                        conv_dtype,
+                        sharding=self.spec_conv_sharding,
+                    ),
+                    jax.ShapeDtypeStruct(
+                        (self.total_slots, T) + recurrent_shape[1:],
+                        temporal_dtype,
+                        sharding=self.spec_recurrent_sharding,
+                    ),
+                ]
             return (
                 [
                     jax.ShapeDtypeStruct(
@@ -183,10 +209,7 @@ class RecurrentStatePool:
                     )
                     for _ in range(self.num_linear_recurrent_layers)
                 ],
-                [
-                    [jax.ShapeDtypeStruct(conv_shape, conv_dtype, sharding=self.conv_sharding)]
-                    for _ in range(self.num_linear_recurrent_layers)
-                ],
+                [list(conv_inner) for _ in range(self.num_linear_recurrent_layers)],
             )
 
         alloc_recurrent = _get_recurrent_zero_allocator(
@@ -204,7 +227,55 @@ class RecurrentStatePool:
                 inner.append(alloc_conv())
                 conv_buffers.append(inner)
 
+            if self.spec_num_draft_tokens > 0:
+                T = self.spec_num_draft_tokens
+                alloc_spec_conv = _get_recurrent_zero_allocator(
+                    (self.total_slots, T) + conv_shape[1:], conv_dtype, self.spec_conv_sharding
+                )
+                alloc_spec_ssm = _get_recurrent_zero_allocator(
+                    (self.total_slots, T) + recurrent_shape[1:],
+                    temporal_dtype,
+                    self.spec_recurrent_sharding,
+                )
+                for inner in conv_buffers:
+                    inner.append(alloc_spec_conv())
+                    inner.append(alloc_spec_ssm())
+
         return recurrent_buffers, conv_buffers
+
+    @property
+    def spec_conv_sharding(self):
+        return NamedSharding(
+            self.mesh, P(self.data_partition_axis, None, self.conv_partition_axis, None)
+        )
+
+    @property
+    def spec_recurrent_sharding(self):
+        return NamedSharding(
+            self.mesh,
+            P(self.data_partition_axis, None, self.recurrent_partition_axis, None, None),
+        )
+
+    def _inner_sharding(self, i: int):
+        return (self.conv_sharding, self.spec_conv_sharding, self.spec_recurrent_sharding)[i]
+
+    def commit_speculative_state(self, recurrent_indices, accept_lens) -> None:
+        """After target verify: running state of each request := its verify state after
+        ``accept_lens`` tokens (bonus included, so step ``accept_lens - 1``). Rows with
+        slot 0 (padding) or ``accept_lens <= 0`` are left alone."""
+        assert self.spec_num_draft_tokens > 0, "pool has no speculative verify scratch"
+        new_recurrent, new_conv = _commit_speculative_state(
+            self.recurrent_buffers,
+            self.conv_buffers,
+            recurrent_indices,
+            accept_lens,
+            mesh=self.mesh,
+            data_axis=self.data_partition_axis,
+            recurrent_axis=self.recurrent_partition_axis,
+            conv_axis=self.conv_partition_axis,
+        )
+        self.recurrent_buffers = list(new_recurrent)
+        self.conv_buffers = [list(inner) for inner in new_conv]
 
     def get_linear_recurrent_layer_cache(self, layer_id: int):
         if layer_id not in self.layers_mapping:
@@ -233,7 +304,7 @@ class RecurrentStatePool:
             for i in range(len(new_conv[layer])):
                 cbuf = new_conv[layer][i]
                 if tp_degenerate:
-                    cbuf = jax.device_put(cbuf, self.conv_sharding)
+                    cbuf = jax.device_put(cbuf, self._inner_sharding(i))
                 self.conv_buffers[layer][i] = cbuf
 
     def clear(self) -> None:
@@ -286,8 +357,9 @@ class RecurrentStatePool:
         new_recurrent = [
             copy_temporal(buf, src_indices, dst_indices) for buf in self.recurrent_buffers
         ]
+        # Only the running conv state is copied; speculative verify scratch is per-forward.
         new_conv = [
-            [copy_conv(cbuf, src_indices, dst_indices) for cbuf in inner]
+            [copy_conv(inner[0], src_indices, dst_indices)] + list(inner[1:])
             for inner in self.conv_buffers
         ]
         return new_recurrent, new_conv
@@ -313,6 +385,7 @@ class RecurrentStatePool:
             self.data_partition_axis,
             self.recurrent_sharding,
             self.conv_sharding,
+            self.spec_num_draft_tokens,
         )
         return children, aux
 
@@ -336,8 +409,10 @@ class RecurrentStatePool:
             data_partition_axis,
             recurrent_sharding,
             conv_sharding,
+            spec_num_draft_tokens,
         ) = aux_data
         obj = cls.__new__(cls)
+        obj.spec_num_draft_tokens = spec_num_draft_tokens
         obj.linear_recurrent_layer_ids = list(linear_recurrent_layer_ids_tup)
         obj.layers_mapping = {
             layer_id: idx for idx, layer_id in enumerate(obj.linear_recurrent_layer_ids)
@@ -367,3 +442,65 @@ class RecurrentStatePool:
         obj.recurrent_buffers = list(new_recurrent)
         obj.conv_buffers = [list(inner) for inner in new_conv]
         return obj
+
+
+@partial(
+    jax.jit,
+    static_argnames=("mesh", "data_axis", "recurrent_axis", "conv_axis"),
+    donate_argnums=(0, 1),
+)
+def _commit_speculative_state(
+    recurrent_buffers,
+    conv_buffers,
+    recurrent_indices,
+    accept_lens,
+    *,
+    mesh,
+    data_axis,
+    recurrent_axis,
+    conv_axis,
+):
+    """Per layer and batch row b: ``ssm[idx[b]] = spec_ssm[b, a[b]-1]`` (same for conv).
+
+    The verify scratch is indexed by batch row (see ``KDAAttnBackend._forward_target_verify``).
+    """
+
+    def _select(buf, spec, idx, acc):
+        buf = jax.lax.optimization_barrier(buf)  # donated-buffer aliasing guard, see copy_slots
+        steps = spec.shape[1]
+        step = jnp.clip(acc - 1, 0, steps - 1)
+        keep = ((idx == 0) | (acc <= 0)).reshape((-1,) + (1,) * (buf.ndim - 1))
+        val = jnp.where(keep, buf[idx], spec[jnp.arange(idx.shape[0]), step])
+        return jax.lax.optimization_barrier(buf.at[idx].set(val))
+
+    commit_ssm = jax.shard_map(
+        _select,
+        mesh=mesh,
+        in_specs=(
+            P(data_axis, recurrent_axis, None, None),
+            P(data_axis, None, recurrent_axis, None, None),
+            P(data_axis),
+            P(data_axis),
+        ),
+        out_specs=P(data_axis, recurrent_axis, None, None),
+        check_vma=False,
+    )
+    commit_conv = jax.shard_map(
+        _select,
+        mesh=mesh,
+        in_specs=(
+            P(data_axis, conv_axis, None),
+            P(data_axis, None, conv_axis, None),
+            P(data_axis),
+            P(data_axis),
+        ),
+        out_specs=P(data_axis, conv_axis, None),
+        check_vma=False,
+    )
+    new_recurrent = []
+    new_conv = []
+    for rec, inner in zip(recurrent_buffers, conv_buffers):
+        conv, spec_conv, spec_ssm = inner
+        new_recurrent.append(commit_ssm(rec, spec_ssm, recurrent_indices, accept_lens))
+        new_conv.append([commit_conv(conv, spec_conv, recurrent_indices, accept_lens), spec_conv, spec_ssm])
+    return new_recurrent, new_conv
