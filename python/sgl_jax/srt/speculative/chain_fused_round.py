@@ -49,6 +49,10 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
 )
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 from sgl_jax.srt.speculative.eagle_util import build_chain_verify_inputs_device
+from sgl_jax.srt.speculative.spec_utils import (
+    SIMULATED_ACCEPTANCE_CONFIG,
+    apply_simulated_acceptance,
+)
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -250,6 +254,27 @@ def _fused_round(
             threshold_acc=threshold_acc),
     )
     accept_length = (accept_length + 1).astype(jnp.int32)
+    if SIMULATED_ACCEPTANCE_CONFIG.enabled:
+        # SIMULATE_ACC_LEN: throughput-mechanism benchmarks with a fixed accept length
+        # (bonus included), same semantics as EagleVerifyInput.sample.
+        cfg = SIMULATED_ACCEPTANCE_CONFIG
+        target_predict = (
+            jnp.argmax(logits, axis=-1).astype(jnp.int32).reshape(bs, T)
+            if cfg.token_mode == "real-draft-token"
+            else None
+        )
+        accept_index, predict, accept_length = apply_simulated_acceptance(
+            accept_index=accept_index,
+            predict=predict,
+            accept_lens=accept_length,
+            candidates=draft_tokens.reshape(bs, T),
+            target_predict=target_predict,
+            valid_mask=valid,
+            spec_steps=steps,
+            topk=1,
+            rng=jax.random.fold_in(key, 1),
+        )
+        accept_length = accept_length.astype(jnp.int32)
 
     # ---- hybrid target: keep the recurrent state after the accepted prefix ----
     if "recurrent_state_pool" in tgt_pools._pools:
