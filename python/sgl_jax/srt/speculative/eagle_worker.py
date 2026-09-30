@@ -102,9 +102,29 @@ class EAGLEWorker(BaseSpecWorker):
                     per_dp_bs_size=per_dp_bs,
                 )
                 if not self._can_use_fused_spec_prefill(model_worker_batch):
-                    logger.warning(
-                        "[SPEC_EXTEND] skip fused precompile because fused spec prefill is disabled"
+                    if self._chain_fused_round is None:
+                        logger.warning(
+                            "[SPEC_EXTEND] skip fused precompile because fused spec prefill is "
+                            "disabled"
+                        )
+                        continue
+                    # Generic spec prefill (target extend with FULL hidden capture + draft
+                    # prefill-extend): neither program is covered by the target's own EXTEND
+                    # precompile, so each new token bucket would otherwise compile on first use.
+                    target = getattr(self.target_worker, "worker", self.target_worker)
+                    model_worker_batch = target.compilation_manager._make_dummy_batch(
+                        bs,
+                        num_tokens,
+                        ForwardMode.EXTEND,
+                        self.precompile_cache_loc_paddings[-1],
+                        speculative_algorithm=self.speculative_algorithm,
+                        dp_size=dp_size,
+                        per_dp_bs_size=per_dp_bs,
                     )
+                    # Runtime spec prefill never carries CoW sources (radix cache is off).
+                    model_worker_batch.recurrent_cow_src_indices = None
+                    self.forward_batch_speculative_generation(model_worker_batch)
+                    jax.block_until_ready(target.model_runner.memory_pools)
                     continue
                 if self.spec_relay_buffers is not None:
                     self.forward_batch_speculative_prefill_overlap(model_worker_batch)
