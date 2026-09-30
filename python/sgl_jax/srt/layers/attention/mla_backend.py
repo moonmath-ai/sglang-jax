@@ -56,6 +56,14 @@ class MLAAttentionMetadata:
     page_indices: jax.Array = None
     seq_lens: jax.Array = None
     distribution: jax.Array = None
+    # Speculative chains only (TARGET_VERIFY / DRAFT_EXTEND): the same batch in request
+    # layout -- one sequence of T causal queries per request, fixed-stride page table --
+    # so per-query work that only reads the cache (the DSA indexer top-k) scans each
+    # request's context once instead of once per virtual sequence.
+    spec_req_seq_lens: jax.Array = None
+    spec_req_page_indices: jax.Array = None
+    spec_req_cu_q_lens: jax.Array = None
+    spec_req_distribution: jax.Array = None
 
     def tree_flatten(self):
         children = (
@@ -64,6 +72,10 @@ class MLAAttentionMetadata:
             self.page_indices,
             self.seq_lens,
             self.distribution,
+            self.spec_req_seq_lens,
+            self.spec_req_page_indices,
+            self.spec_req_cu_q_lens,
+            self.spec_req_distribution,
         )
         aux_data = {}
         return (children, aux_data)
@@ -71,11 +83,17 @@ class MLAAttentionMetadata:
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         obj = cls.__new__(cls)
-        obj.cu_q_lens = children[0]
-        obj.cu_kv_lens = children[1]
-        obj.page_indices = children[2]
-        obj.seq_lens = children[3]
-        obj.distribution = children[4]
+        (
+            obj.cu_q_lens,
+            obj.cu_kv_lens,
+            obj.page_indices,
+            obj.seq_lens,
+            obj.distribution,
+            obj.spec_req_seq_lens,
+            obj.spec_req_page_indices,
+            obj.spec_req_cu_q_lens,
+            obj.spec_req_distribution,
+        ) = children
         return obj
 
 
@@ -213,6 +231,140 @@ class MLAAttentionBackend(AttentionBackend):
             sharding=(NamedSharding(self.mesh, P(self.attention_data_partition_axis))),
         )
         return metadata
+
+    # ------------------------------------------------------------------
+    # Speculative decoding (EAGLE / NEXTN, topk=1 chain)
+    # ------------------------------------------------------------------
+    #
+    # Every spec forward is expressed as a *decode* batch so the one-query-per-sequence
+    # kernels (MLA decode, DSA indexer top-k + page-level sparse MLA) apply unchanged:
+    #
+    #   * TARGET_VERIFY / DRAFT_EXTEND: T tokens per request at KV slots S..S+T-1 become T
+    #     "virtual" sequences sharing the request's page table, virtual seq j having
+    #     kv_len = S + j + 1 (causal chain, the new token is the last KV slot).
+    #   * draft decode step i: one token per request with kv_len = seq_lens + i.
+    #
+    # ``S`` is the committed KV length: ``seq_lens`` after ``prepare_for_verify`` for
+    # TARGET_VERIFY, ``seq_lens - (T - 1)`` after ``prepare_for_extend_after_verify`` for
+    # DRAFT_EXTEND. Page tables come from ``padding_for_decode``'s ``cache_loc``, which packs
+    # each valid request's page-start token locations over its page-aligned
+    # ``allocate_len`` region. dp_size == 1 only.
+
+    def _spec_request_pages(self, batch: ModelWorkerBatch):
+        """Per padded request slot: its physical page ids (None for padding slots)."""
+        if batch.dp_size != 1:
+            raise NotImplementedError("MLA speculative metadata supports dp_size == 1 only")
+        seq_lens = np.asarray(batch.seq_lens)
+        valid = seq_lens > 0
+        allocate_lens = np.asarray(batch.spec_info_padded.allocate_lens)
+        if len(allocate_lens) == len(seq_lens):
+            allocate_lens = allocate_lens[valid]
+        n_valid = int(valid.sum())
+        assert len(allocate_lens) >= n_valid, (len(allocate_lens), n_valid)
+        cache_loc = np.asarray(batch.cache_loc)
+        pages: list[np.ndarray | None] = [None] * len(seq_lens)
+        base = 0
+        for slot, alloc in zip(np.nonzero(valid)[0], allocate_lens[:n_valid]):
+            aligned = int(cdiv(int(alloc), self.page_size)) * self.page_size
+            pages[slot] = cache_loc[base : base + aligned : self.page_size] // self.page_size
+            base += aligned
+        return pages, len(cache_loc) // self.page_size
+
+    def _virtual_decode_arrays(
+        self, slot_pages, kv_lens: np.ndarray, virtual_slot: np.ndarray, page_capacity: int
+    ) -> tuple[np.ndarray, ...]:
+        """Host arrays ``(cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution)`` of a
+        decode batch where virtual seq v attends ``kv_lens[v]`` tokens of request
+        ``virtual_slot[v]``'s pages. Valid virtual seqs must form a prefix."""
+        num_seqs = len(kv_lens)
+        n_pages = cdiv(kv_lens, self.page_size).astype(np.int64)
+        assert int(n_pages.sum()) <= page_capacity, (int(n_pages.sum()), page_capacity)
+        page_indices = np.zeros(page_capacity, dtype=np.int32)
+        off = 0
+        for v in range(num_seqs):
+            n = int(n_pages[v])
+            if n:
+                page_indices[off : off + n] = slot_pages[virtual_slot[v]][:n]
+                off += n
+        cu_kv_lens = np.zeros(num_seqs + 1, dtype=np.int32)
+        cu_kv_lens[1:] = np.cumsum(n_pages * self.page_size)
+        cu_q_lens = np.arange(num_seqs + 1, dtype=np.int32)
+        n_valid = int(np.sum(kv_lens > 0))
+        assert np.all(kv_lens[:n_valid] > 0) and np.all(kv_lens[n_valid:] == 0)
+        distribution = np.array([n_valid, n_valid, n_valid], dtype=np.int32)
+        return cu_q_lens, cu_kv_lens, page_indices, kv_lens.astype(np.int32), distribution
+
+    def metadata_from_arrays(self, arrays, *, upload: bool = True) -> MLAAttentionMetadata:
+        """Wrap ``_virtual_decode_arrays`` output (5 arrays), optionally followed by the
+        4 ``spec_req_*`` request-layout arrays (host, or already on device)."""
+        if upload:
+            arrays = device_array(
+                tuple(arrays),
+                sharding=(NamedSharding(self.mesh, P(self.attention_data_partition_axis))),
+            )
+        return MLAAttentionMetadata(*arrays)
+
+    def _spec_request_layout_arrays(self, slot_pages, committed, valid, T, pages_per_seq):
+        """Request-layout view of a T-token chain: seq_len = S + T, T causal queries."""
+        bs = len(committed)
+        seq = np.where(valid, committed + T, 0).astype(np.int32)
+        pi = np.zeros((bs, pages_per_seq), dtype=np.int32)
+        for r in np.nonzero(valid)[0]:
+            n = int(cdiv(int(seq[r]), self.page_size))
+            pi[r, :n] = slot_pages[r][:n]
+        cu_q = (np.arange(bs + 1) * T).astype(np.int32)
+        n_valid = int(valid.sum())
+        dist = np.array([0, 0, n_valid], dtype=np.int32)  # all "mixed": multi-query rows
+        return seq, pi.reshape(-1), cu_q, dist
+
+    def eagle_forward_metadata_arrays(self, batch: ModelWorkerBatch):
+        """Host arrays for TARGET_VERIFY / DRAFT_EXTEND (see get_eagle_forward_metadata)."""
+        seq_lens = np.asarray(batch.seq_lens, dtype=np.int64)
+        bs = len(seq_lens)
+        if batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            T = int(batch.spec_info_padded.draft_token_num)
+            committed = seq_lens
+        elif batch.forward_mode == ForwardMode.DRAFT_EXTEND:
+            T = int(np.asarray(batch.input_ids).shape[0]) // bs
+            committed = seq_lens - (T - 1)
+        else:
+            raise ValueError(f"Invalid speculative forward mode: {batch.forward_mode}")
+        slot_pages, total_pages = self._spec_request_pages(batch)
+        valid = seq_lens > 0
+        j = np.arange(T, dtype=np.int64)
+        kv_lens = np.where(valid[:, None], committed[:, None] + j[None, :] + 1, 0).reshape(-1)
+        virtual_slot = np.repeat(np.arange(bs), T)
+        virtual = self._virtual_decode_arrays(slot_pages, kv_lens, virtual_slot, T * total_pages)
+        # Same fixed stride as the virtual layout's pages_per_seq (= len(pi) // num_seqs).
+        req = self._spec_request_layout_arrays(
+            slot_pages, committed, valid, T, (T * total_pages) // (T * bs)
+        )
+        return virtual + req
+
+    def eagle_multi_step_metadata_arrays(self, batch: ModelWorkerBatch):
+        """Host arrays per draft decode step i (kv_len = seq_lens + i)."""
+        assert batch.forward_mode == ForwardMode.DECODE
+        assert batch.speculative_eagle_topk == 1, "MLA speculative decoding requires topk == 1"
+        seq_lens = np.asarray(batch.seq_lens, dtype=np.int64)
+        slot_pages, total_pages = self._spec_request_pages(batch)
+        valid = seq_lens > 0
+        virtual_slot = np.arange(len(seq_lens))
+        return [
+            self._virtual_decode_arrays(
+                slot_pages, np.where(valid, seq_lens + i, 0), virtual_slot, total_pages
+            )
+            for i in range(batch.speculative_num_steps)
+        ]
+
+    def get_eagle_forward_metadata(self, batch: ModelWorkerBatch, **kwargs):
+        """Metadata for draft prefill (EXTEND), TARGET_VERIFY and DRAFT_EXTEND."""
+        if batch.forward_mode == ForwardMode.EXTEND:
+            return self.get_forward_metadata(batch)
+        return self.metadata_from_arrays(self.eagle_forward_metadata_arrays(batch))
+
+    def get_eagle_multi_step_metadata(self, batch: ModelWorkerBatch):
+        """One decode metadata per draft step i: kv_len = seq_lens + i."""
+        return [self.metadata_from_arrays(a) for a in self.eagle_multi_step_metadata_arrays(batch)]
 
     def tree_flatten(self):
         children = (self.forward_metadata,)

@@ -95,6 +95,11 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         elif batch.forward_mode == ForwardMode.DECODE:
             single_cu = np.arange(batch.per_dp_bs_size + 1, dtype=np.int32)
             cu_q_lens = np.tile(single_cu, batch.dp_size)
+        elif batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            # Linear chain of draft_token_num tokens per request (topk == 1).
+            T = int(batch.spec_info_padded.draft_token_num)
+            single_cu = np.arange(batch.per_dp_bs_size + 1, dtype=np.int32) * T
+            cu_q_lens = np.tile(single_cu, batch.dp_size)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
@@ -193,6 +198,14 @@ class HybridLinearAttnBackend(AttentionBackend):
     def get_forward_metadata(self, batch):
         return HybridLinearAttnBackendMetadata(
             full_attn_metadata=self.full_attn_backend.get_forward_metadata(batch),
+            linear_attn_metadata=self.linear_attn_backend.get_forward_metadata(batch),
+        )
+
+    def get_eagle_forward_metadata(self, batch, **kwargs):
+        """Target verify of a hybrid model: full layers get the full backend's speculative
+        metadata, recurrent layers the per-request chain metadata."""
+        return HybridLinearAttnBackendMetadata(
+            full_attn_metadata=self.full_attn_backend.get_eagle_forward_metadata(batch, **kwargs),
             linear_attn_metadata=self.linear_attn_backend.get_forward_metadata(batch),
         )
 

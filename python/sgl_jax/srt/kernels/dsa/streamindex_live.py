@@ -201,5 +201,126 @@ def streamindex_topk_live(
     # The single pass scores every (padded) decode row at the bucket of the longest live
     # context, so with few active rows the grouped loop, which scores only active rows, is
     # cheaper (e.g. one long request in a bs-16 decode bucket).
-    n_active = jnp.sum(live)
-    return jax.lax.cond(n_active > _SINGLE_PASS_MIN_ROWS, _single_pass, _grouped)
+    n_active = jnp.sum((jnp.arange(batch) < distribution[0]) & (seq_lens > 0))
+    return jax.lax.cond(
+        n_active > _SINGLE_PASS_MIN_ROWS, _single_pass, lambda: _grouped(q, weights, seq_lens)
+    )
+
+
+@jax.jit(static_argnames=("k", "queries_per_seq", "pages_per_seq", "num_kv_pages_per_block"))
+def streamindex_topk_live_multiq(
+    q: jax.Array,
+    weights: jax.Array,
+    cache_kv: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    *,
+    k: int,
+    queries_per_seq: int,
+    pages_per_seq: int,
+    num_kv_pages_per_block: int = 64,
+) -> jax.Array:
+    """Live-context top-k for sequences that each end in ``queries_per_seq`` causal queries.
+
+    Speculative chains: sequence b holds ``seq_lens[b]`` keys and its last
+    ``queries_per_seq`` positions are the queries, query j seeing keys ``< seq_len - Tq + j + 1``.
+    Returns int32[B * Tq, k] seq-local token indices (-1 padded) -- the same top-k as
+    ``streamindex_topk_live`` over one virtual sequence per query, but each sequence's keys
+    are scored in one pass. ``page_indices`` is fixed-stride ``[B * pages_per_seq]``.
+
+    Same live-bucket dispatch as ``streamindex_topk_live``: rows are grouped by the
+    power-of-two page bucket of their live length, so work and the exit-stage top-k stay
+    bounded by the live context rather than the page-table capacity.
+    """
+    Tq = queries_per_seq
+    batch = seq_lens.shape[0]
+    if q.ndim != 3 or q.shape[0] != batch * Tq:
+        raise ValueError("expected q [batch * queries_per_seq, heads, dim]")
+    if cache_kv.ndim != 3 or q.shape[-1] != cache_kv.shape[-1]:
+        raise ValueError("Expected [pages,page_size,head_dim] indexer cache")
+    if q.shape[-1] % 128:
+        raise ValueError("Pallas indexer requires a head dimension divisible by 128")
+    page_size = cache_kv.shape[1]
+    if page_indices.shape[0] < batch * pages_per_seq:
+        raise ValueError("Page table is smaller than batch * pages_per_seq")
+    if page_size * num_kv_pages_per_block % 128:
+        raise ValueError("KV block must contain a multiple of 128 tokens")
+    if cache_kv.dtype != jnp.bfloat16 or page_size % 2:
+        raise ValueError("Live indexer requires BF16 cache and an even page size")
+    buckets = _page_buckets(pages_per_seq, min(16, num_kv_pages_per_block))
+    limits = jnp.asarray([pages * page_size for pages in buckets], jnp.int32)
+    cache4d = cache_kv.reshape(cache_kv.shape[0], page_size // 2, 2, cache_kv.shape[-1])
+    if batch == 0:
+        return jnp.full((0, k), -1, jnp.int32)
+
+    q = q.reshape(batch, Tq, *q.shape[1:])
+    weights = weights.reshape(batch, Tq, weights.shape[-1])
+    group_size = min(4, batch)
+    padded_batch = ((batch + group_size - 1) // group_size) * group_size + group_size - 1
+    page_starts = jnp.arange(batch, dtype=jnp.int32) * pages_per_seq
+    if padded_batch != batch:
+        pad = padded_batch - batch
+        q = jnp.pad(q, ((0, pad), (0, 0), (0, 0), (0, 0)))
+        weights = jnp.pad(weights, ((0, pad), (0, 0), (0, 0)))
+        seq_lens = jnp.pad(seq_lens, ((0, pad),))
+        page_starts = jnp.pad(page_starts, ((0, pad),))
+
+    active = seq_lens > 0
+    row_buckets = jnp.sum(seq_lens[:, None] > limits[None, :], axis=1, dtype=jnp.int32)
+    row_buckets = jnp.where(active, row_buckets, len(buckets))
+    order = jnp.argsort(row_buckets, stable=True)
+    sorted_buckets = row_buckets[order]
+    active_count = jnp.sum(active, dtype=jnp.int32)
+
+    group_cuq = jnp.arange(group_size + 1, dtype=jnp.int32) * Tq
+    group_dist = jnp.asarray([0, 0, group_size], jnp.int32)  # all mixed: Tq queries per seq
+    bucket_branches = []
+    for bucket_pages in buckets:
+        def score_and_select(args, bucket_pages=bucket_pages):
+            q_group, w_group, lengths_group, starts_group, group_order, out = args
+            offsets = starts_group[:, None] + jnp.arange(bucket_pages, dtype=jnp.int32)[None, :]
+            offsets = jnp.minimum(offsets, page_indices.shape[0] - 1)
+            pages = page_indices[offsets].reshape(-1)
+            selected = streamindex_topk(
+                q_group.reshape(group_size * Tq, *q_group.shape[2:]),
+                w_group.reshape(group_size * Tq, w_group.shape[-1]),
+                cache4d,
+                lengths_group,
+                pages,
+                group_cuq,
+                group_dist,
+                k=k,
+                compression_ratio=1,
+                num_kv_pages_per_block=min(bucket_pages, num_kv_pages_per_block),
+                num_queries_per_block=Tq,
+                topk_backend="chunked",
+            ).reshape(group_size, Tq, k)
+            old = out[group_order]
+            keep = (lengths_group > 0)[:, None, None]
+            return out.at[group_order].set(jnp.where(keep, selected, old))
+
+        bucket_branches.append(score_and_select)
+
+    def condition(carry):
+        cursor, _ = carry
+        return cursor < active_count
+
+    def group_step(carry):
+        cursor, out = carry
+        group_order = jax.lax.dynamic_slice_in_dim(order, cursor, group_size)
+        group_buckets = jax.lax.dynamic_slice_in_dim(sorted_buckets, cursor, group_size)
+        bucket = group_buckets[0]
+        in_bucket = group_buckets == bucket
+        run_size = jnp.sum(in_bucket, dtype=jnp.int32)
+        lengths_group = jnp.where(in_bucket, seq_lens[group_order], 0)
+        out = jax.lax.switch(
+            bucket,
+            tuple(bucket_branches),
+            (q[group_order], weights[group_order], lengths_group, page_starts[group_order],
+             group_order, out),
+        )
+        return cursor + run_size, out
+
+    out = jnp.full((padded_batch, Tq, k), -1, jnp.int32)
+    _, out = jax.lax.while_loop(condition, group_step, (jnp.asarray(0, jnp.int32), out))
+    return out[:batch].reshape(batch * Tq, k)
