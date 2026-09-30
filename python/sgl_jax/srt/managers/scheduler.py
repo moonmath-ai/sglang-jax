@@ -416,7 +416,11 @@ class Scheduler(
             # DeepSeek-style configs expose num_nextn_predict_layers; MiMo-style
             # configs don't, so fall back to --speculative-num-steps under NEXTN
             # (one MTP weight set per step).
-            n_mtp = getattr(self.tp_worker.model_config.hf_config, "num_nextn_predict_layers", None)
+            target_model_config = self.tp_worker.model_config
+            n_mtp = getattr(target_model_config.hf_config, "num_nextn_predict_layers", None)
+            if n_mtp is None:
+                # Multimodal wrappers (e.g. GLM-5.3-Flash) keep it on the text config.
+                n_mtp = getattr(target_model_config.hf_text_config, "num_nextn_predict_layers", None)
             if n_mtp is None and self.spec_algorithm.is_nextn():
                 n_mtp = server_args.speculative_num_steps
             self._spec_multi_layer = n_mtp is not None and n_mtp > 1
