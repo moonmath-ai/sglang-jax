@@ -49,6 +49,11 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
 )
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 from sgl_jax.srt.speculative.eagle_util import build_chain_verify_inputs_device
+from sgl_jax.srt.speculative.relay_buffer import (
+    gather_spec_relay_buffers,
+    make_dp_valid_mask,
+    update_spec_relay_buffers,
+)
 from sgl_jax.srt.speculative.spec_utils import (
     SIMULATED_ACCEPTANCE_CONFIG,
     apply_simulated_acceptance,
@@ -158,43 +163,69 @@ def _unpack(blob, layout, name):
 def _fused_round(
     tgt_def, tgt_state_def, tgt_leaves, tgt_pools,
     dr_def, dr_state_def, dr_leaves, dr_pools,
-    elm, int_blob, f32_blob, hidden, base_key,
-    *, layout, steps, T, bs, threshold_single, threshold_acc, mesh, tgt_backend_def,
-    dr_backend_def,
+    elm, int_blob, f32_blob, hidden, base_key, relay,
+    *, layout, steps, T, bs, threshold_single, threshold_acc, mesh, use_relay,
+    tgt_backend_def, dr_backend_def,
 ):
     rep = NamedSharding(mesh, P())
     data = NamedSharding(mesh, P("data"))
     I = lambda name: _unpack(int_blob, layout, name)  # noqa: E731
     F = lambda name: _unpack(f32_blob, layout, name)  # noqa: E731
-    D = lambda name: jax.sharding.reshard(I(name), data)  # noqa: E731
+    D = lambda x: jax.sharding.reshard(x, data)  # noqa: E731
 
-    def mla_md(prefix):
-        return MLAAttentionMetadata(*(
-            D(prefix + k) if (prefix + k) in layout else None for k in _MD_KEYS))
-
-    seq_lens = I("seq_lens")
-    verified_id = I("verified_id")
-    first_draft_token = I("first_draft")
+    valid = I("valid") != 0
+    if use_relay:
+        # Overlap schedule: this round's entry state was written by the previous round (or
+        # the prefill) into the req-indexed relay; the host never saw it.
+        future_indices = I("future_indices")
+        relay_topk, relay_hidden, relay_vid, relay_seq = gather_spec_relay_buffers(
+            relay, D(future_indices), dp_size=1
+        )
+        seq_lens = jnp.where(valid, jax.sharding.reshard(relay_seq, rep), 0)
+        verified_id = jax.sharding.reshard(relay_vid, rep)
+        first_draft_token = jax.sharding.reshard(relay_topk, rep)[:, 0]
+        hidden = jax.sharding.reshard(relay_hidden, rep)
+    else:
+        seq_lens = I("seq_lens")
+        verified_id = I("verified_id")
+        first_draft_token = I("first_draft")
     recurrent_indices = I("recurrent_indices")
-    extend_seq_lens = D("extend_seq_lens")
-    extend_logits_indices = D("extend_logits_indices")
+    extend_seq_lens = D(I("extend_seq_lens"))
+    extend_logits_indices = D(I("extend_logits_indices"))
     temperatures, top_ps = F("temperatures"), F("top_ps")
     top_ks = I("top_ks")
     is_greedy, use_top_p = I("is_greedy")[0] != 0, I("use_top_p")[0] != 0
     key = jax.random.fold_in(base_key, I("round_id")[0])
-    dr_step_mds = [mla_md(f"step{i}_") for i in range(steps - 1)]
-    dr_extend_md = mla_md("extend_")
+
+    # Metadata: host-built, length-independent layout + lengths derived here from seq_lens
+    # (MLAAttentionBackend.spec_chain_layout / spec_chain_lengths).
+    verified_seq_lens = jnp.where(valid, seq_lens - 1, 0)
+    chain_kv, req_seq = MLAAttentionBackend.spec_chain_lengths(
+        verified_seq_lens, valid, T, xp=jnp
+    )
+    chain_md = MLAAttentionMetadata(
+        D(I("chain_cu_q")), D(I("chain_cu_kv")), D(I("chain_pi")), D(chain_kv),
+        D(I("chain_dist")), D(req_seq), D(I("req_pi")), D(I("req_cuq")), D(I("req_dist")),
+    )
+    dr_step_mds = [
+        MLAAttentionMetadata(
+            D(I("step_cu_q")), D(I("step_cu_kv")), D(I("step_pi")),
+            D(jnp.where(valid, seq_lens + i, 0).astype(jnp.int32)), D(I("step_dist")),
+        )
+        for i in range(steps - 1)
+    ]
+    dr_extend_md = chain_md
 
     tgt_backend = jax.tree_util.tree_unflatten(tgt_backend_def, [])
     if isinstance(tgt_backend, HybridLinearAttnBackend):
         tgt_backend.forward_metadata = HybridLinearAttnBackendMetadata(
-            full_attn_metadata=mla_md("verify_"),
+            full_attn_metadata=chain_md,
             linear_attn_metadata=LinearRecurrentAttnBackendMetadata(
-                cu_q_lens=D("kda_cu_q"), recurrent_indices=D("recurrent_indices"),
-                has_initial_state=D("has_initial_state") != 0),
+                cu_q_lens=D(I("kda_cu_q")), recurrent_indices=D(recurrent_indices),
+                has_initial_state=D(I("has_initial_state")) != 0),
         )
     else:
-        tgt_backend.forward_metadata = mla_md("verify_")
+        tgt_backend.forward_metadata = chain_md
     dr_backend = jax.tree_util.tree_unflatten(dr_backend_def, [])
 
     def fb(mode, n, backend):
@@ -225,8 +256,6 @@ def _fused_round(
     token_list = jnp.stack(tokens, axis=1)  # [bs, steps]
 
     # ---- target verify over [bonus, d1, .., d_{T-1}] ----
-    valid = seq_lens > 0
-    verified_seq_lens = jnp.where(valid, seq_lens - 1, 0)
     packed = build_chain_verify_inputs_device(verified_id, token_list, verified_seq_lens, T, bs)
     packed = jax.sharding.reshard(packed, rep)
     draft_tokens, positions = packed[0], packed[1]
@@ -322,9 +351,20 @@ def _fused_round(
     top_logit, top_index = jax.lax.top_k(ext_logits.astype(jnp.float32), 1)
     topk_p = jnp.exp(top_logit - lse)
 
+    top_index = top_index.astype(jnp.int32)
+    new_relay = None
+    if use_relay:
+        relay_topk = jnp.zeros((bs, relay.topk_index.shape[-1]), jnp.int32).at[:, 0].set(
+            top_index[:, 0])
+        new_relay = update_spec_relay_buffers(
+            relay, D(future_indices), D(valid), D(relay_topk),
+            jax.sharding.reshard(next_hidden.astype(relay.hidden_states.dtype),
+                                 NamedSharding(mesh, P("data", None))),
+            D(next_verified_id), D(new_seq_lens.astype(jnp.int32)), dp_size=1,
+        )
     host_outputs = (predict, accept_length, verified_flat, next_verified_id, topk_p,
-                    top_index.astype(jnp.int32), next_hidden, new_seq_lens)
-    return tgt_updates, dr_updates, host_outputs
+                    top_index, next_hidden, new_seq_lens)
+    return tgt_updates, dr_updates, host_outputs, new_relay
 
 
 class ChainFusedRound:
@@ -357,14 +397,23 @@ class ChainFusedRound:
             partial(_fused_round, tgt_backend_def=tgt_def, dr_backend_def=dr_def),
             donate_argnames=("tgt_pools", "dr_pools"),
             static_argnames=("tgt_state_def", "dr_state_def", "layout", "steps", "T", "bs",
-                             "threshold_single", "threshold_acc", "mesh"),
+                             "threshold_single", "threshold_acc", "mesh", "use_relay"),
             compiler_options=compiler_options,
         )
 
     def supports_batch(self, mwb) -> bool:
         return not (mwb.return_logprob or getattr(mwb, "return_output_logprob_only", False))
 
-    def run(self, mwb, cur_allocate_lens):
+    def run(self, mwb, cur_allocate_lens, *, overlap: bool = False):
+        """One speculative decode round.
+
+        ``overlap=False``: entry state (bonus token, first draft token, draft hidden,
+        seq_lens) comes from the host batch and results are read back before returning.
+        ``overlap=True`` (overlap schedule): entry state is gathered from the spec relay
+        buffers inside the JIT and next-round state is scattered back; nothing is read
+        back -- ``predict`` / ``accept_lens`` stay on device and the scheduler resolves them
+        one round later, while the next round is already running.
+        """
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 
         sw = self.sw
@@ -373,28 +422,17 @@ class ChainFusedRound:
         tmr = sw.target_worker.model_runner
         dmr = dw.draft_model_runner
 
-        # Host: pad to the bs bucket, build every phase's metadata, upload once.
+        # Host: pad to the bs bucket, build the length-independent layout, upload once.
         dw.padding_for_decode(mwb)
         spec = mwb.spec_info_padded
+        spec.allocate_lens = cur_allocate_lens
         seq_lens = np.asarray(mwb.seq_lens, dtype=np.int32)
         bs = len(seq_lens)
         sel = np.asarray(mwb.logits_indices_selector)
         dr_mla = _mla_backend(dmr.attn_backend)
-        tgt_mla = _mla_backend(tmr.attn_backend)
 
-        step_arrays = dr_mla.eagle_multi_step_metadata_arrays(mwb)[: steps - 1]
-        verify_view = _BatchView(mwb, forward_mode=ForwardMode.TARGET_VERIFY,
-                                 seq_lens=np.where(seq_lens > 0, seq_lens - 1, 0),
-                                 spec_info_padded=_SpecView(draft_token_num=T,
-                                                            allocate_lens=cur_allocate_lens))
-        verify_arrays = tgt_mla.eagle_forward_metadata_arrays(verify_view)
-        extend_view = _BatchView(mwb, forward_mode=ForwardMode.DRAFT_EXTEND,
-                                 seq_lens=np.where(seq_lens > 0, seq_lens - 1 + T - 1, 0),
-                                 input_ids=np.empty(bs * T, np.int32),
-                                 spec_info_padded=_SpecView(allocate_lens=cur_allocate_lens))
-        extend_arrays = dr_mla.eagle_forward_metadata_arrays(extend_view)
-
-        valid = seq_lens > 0
+        layout_arrays = dr_mla.spec_chain_layout(mwb, T)
+        valid = layout_arrays["valid"]
         extend_seq_lens = np.where(valid, T, 0).astype(np.int32)
         extend_logits_indices = (np.arange(bs, dtype=np.int32) * T + T - 1).astype(np.int32)
         recurrent_indices = mwb.recurrent_indices
@@ -409,64 +447,85 @@ class ChainFusedRound:
         top_ps = _pad_rows(np.asarray(sampling_info.top_ps, np.float32).reshape(-1), bs, 1.0)
         use_top_p = bool(np.any(top_ps[sel] < 1.0))
 
-        verified_id = np.asarray(spec.verified_id, np.int32).reshape(-1)[:bs]
-        first_draft = np.asarray(spec.topk_index, np.int32).reshape(bs, -1)[:, 0]
-        hidden = spec.hidden_states
-
         rep = NamedSharding(self.mesh, P())
         self._round_id += 1
-        named_int = []
-        for i, arrs in enumerate(step_arrays):
-            named_int += _md_named(f"step{i}_", arrs)
-        named_int += _md_named("verify_", verify_arrays) + _md_named("extend_", extend_arrays)
-        named_int += [
+        cu_q, cu_kv, pi, dist = layout_arrays["chain"]
+        req_pi, req_cuq, req_dist = layout_arrays["req"]
+        s_cu_q, s_cu_kv, s_pi, s_dist = layout_arrays["step"]
+        named_int = [
+            ("valid", valid.astype(np.int32)),
+            ("chain_cu_q", cu_q), ("chain_cu_kv", cu_kv), ("chain_pi", pi), ("chain_dist", dist),
+            ("req_pi", req_pi), ("req_cuq", req_cuq), ("req_dist", req_dist),
+            ("step_cu_q", s_cu_q), ("step_cu_kv", s_cu_kv), ("step_pi", s_pi),
+            ("step_dist", s_dist),
             ("kda_cu_q", np.arange(bs + 1, dtype=np.int32) * T),  # unused by the chain kernel
             ("recurrent_indices", np.asarray(recurrent_indices, np.int32)),
             ("has_initial_state", np.ones(bs, np.int32)),
             ("extend_seq_lens", extend_seq_lens),
             ("extend_logits_indices", extend_logits_indices),
-            ("seq_lens", seq_lens),
-            ("verified_id", verified_id),
-            ("first_draft", first_draft),
             ("top_ks", top_ks),
             ("is_greedy", np.asarray([int(is_greedy)], np.int32)),
             ("use_top_p", np.asarray([int(use_top_p)], np.int32)),
             ("round_id", np.asarray([self._round_id], np.int32)),
         ]
+        if overlap:
+            req_pool = _pad_rows(np.asarray(mwb.req_pool_indices, np.int32).reshape(-1), bs, 0)
+            named_int.append(("future_indices", np.where(valid, req_pool, 0).astype(np.int32)))
+            hidden = None
+            relay = sw.spec_relay_buffers
+            assert relay is not None, "overlap spec decode needs spec relay buffers"
+        else:
+            named_int += [
+                ("seq_lens", seq_lens),
+                ("verified_id", np.asarray(spec.verified_id, np.int32).reshape(-1)[:bs]),
+                ("first_draft", np.asarray(spec.topk_index, np.int32).reshape(bs, -1)[:, 0]),
+            ]
+            hidden = spec.hidden_states
+            if not isinstance(hidden, jax.Array):
+                hidden = np.asarray(hidden)
+            relay = None
         named_f32 = [("temperatures", temperatures), ("top_ps", top_ps)]
         int_blob, int_layout = _pack(named_int, np.int32)
         f32_blob, f32_layout = _pack(named_f32, np.float32)
-        layout = {**int_layout, **f32_layout}
-        layout_key = tuple(sorted(layout.items()))
-        if not isinstance(hidden, jax.Array):
-            hidden = np.asarray(hidden)
+        layout_key = tuple(sorted({**int_layout, **f32_layout}.items()))
         int_dev, f32_dev, hidden = jax.device_put((int_blob, f32_blob, hidden), rep)
 
         with jax.set_mesh(self.mesh):
-            tgt_updates, dr_updates, outs = self._jit(
+            tgt_updates, dr_updates, outs, new_relay = self._jit(
                 tmr._model_def, tmr._model_state_def, tmr.model_state_leaves, tmr.memory_pools,
                 dmr._model_def, dmr._model_state_def, dmr.model_state_leaves, dmr.memory_pools,
                 get_global_expert_location_metadata(), int_dev, f32_dev, hidden, self._key,
+                relay,
                 layout=_Layout(layout_key), steps=steps, T=T, bs=bs,
                 threshold_single=float(
                     global_server_args_dict["speculative_accept_threshold_single"]),
                 threshold_acc=float(global_server_args_dict["speculative_accept_threshold_acc"]),
-                mesh=self.mesh,
+                mesh=self.mesh, use_relay=overlap,
             )
         tmr.memory_pools.replace_all(tgt_updates)
         dmr.memory_pools.replace_all(dr_updates)
+        allocate_lens = np.asarray(cur_allocate_lens)[: mwb.real_bs]
 
-        (predict, accept_length, verified_flat, next_verified, topk_p, topk_index, next_hidden,
-         new_seq_lens) = jax.device_get(outs)
-        real = sel
-        next_draft_input = EagleDraftInput(
-            verified_id=next_verified[real],
-            new_seq_lens=new_seq_lens,
-            allocate_lens=np.asarray(cur_allocate_lens)[: mwb.real_bs],
-            hidden_states=next_hidden[real],
-            topk_p=topk_p[real],
-            topk_index=topk_index[real],
-        )
+        if overlap:
+            sw.spec_relay_buffers = new_relay
+            predict, accept_length = outs[0], outs[1]
+            for arr in (predict, accept_length):
+                arr.copy_to_host_async()
+            next_draft_input = EagleDraftInput(
+                future_indices=np.asarray(mwb.req_pool_indices, np.int32)[sel],
+                allocate_lens=allocate_lens,
+            )
+        else:
+            (predict, accept_length, verified_flat, next_verified, topk_p, topk_index,
+             next_hidden, new_seq_lens) = jax.device_get(outs)
+            next_draft_input = EagleDraftInput(
+                verified_id=next_verified[sel],
+                new_seq_lens=new_seq_lens,
+                allocate_lens=allocate_lens,
+                hidden_states=next_hidden[sel],
+                topk_p=topk_p[sel],
+                topk_index=topk_index[sel],
+            )
         mwb.spec_info_padded = next_draft_input
         batch_output = GenerationBatchResult(
             logits_output=LogitsProcessorOutput(next_token_logits=None, hidden_states=None),
@@ -482,6 +541,47 @@ class ChainFusedRound:
         if launch_done is not None:
             launch_done.set()
         return batch_output
+
+    def publish_prefill(self, mwb, next_token_ids, draft_input):
+        """Overlap schedule: after a (non-fused) spec prefill, write each request's first
+        decode-round state into the relay and switch its draft input to relay handles."""
+        sw = self.sw
+        sel = np.asarray(mwb.logits_indices_selector)
+        bs = len(mwb.seq_lens)
+        valid = make_dp_valid_mask(mwb.real_bs_per_dp, total_bs=bs, per_dp_bs=mwb.per_dp_bs_size)
+        future = np.zeros(bs, np.int32)
+        future[sel] = np.asarray(mwb.req_pool_indices, np.int32)[sel]
+        steps = sw.spec_relay_buffers.topk_index.shape[-1]
+        topk = np.zeros((bs, steps), np.int32)
+        topk[sel, 0] = np.asarray(draft_input.topk_index, np.int32).reshape(len(sel), -1)[:, 0]
+        hidden = np.zeros((bs,) + tuple(np.asarray(draft_input.hidden_states).shape[1:]),
+                          np.asarray(draft_input.hidden_states).dtype)
+        hidden[sel] = np.asarray(draft_input.hidden_states)
+        vid = np.zeros(bs, np.int32)
+        vid[sel] = np.asarray(jax.device_get(next_token_ids)).reshape(-1)[sel]
+        new_seq = np.zeros(bs, np.int32)
+        # First decode round's entry seq_lens (= prompt + pending bonus token).
+        new_seq[sel] = np.asarray(mwb.seq_lens, np.int32)[sel] + 1
+        with jax.set_mesh(self.mesh):
+            sw.spec_relay_buffers = _publish_relay(
+                sw.spec_relay_buffers, future, valid, topk, hidden, vid, new_seq)
+        return EagleDraftInput(
+            future_indices=np.asarray(mwb.req_pool_indices, np.int32)[sel],
+            allocate_lens=np.asarray(mwb.seq_lens, np.int32)[sel],
+        )
+
+
+@jax.jit
+def _publish_relay(relay, future, valid, topk, hidden, vid, new_seq):
+    mesh = jax.typeof(relay.verified_id).sharding.mesh
+    data = NamedSharding(mesh, P("data"))
+    data2 = NamedSharding(mesh, P("data", None))
+    return update_spec_relay_buffers(
+        relay, jax.sharding.reshard(future, data), jax.sharding.reshard(valid, data),
+        jax.sharding.reshard(topk, data2),
+        jax.sharding.reshard(hidden.astype(relay.hidden_states.dtype), data2),
+        jax.sharding.reshard(vid, data), jax.sharding.reshard(new_seq, data), dp_size=1,
+    )
 
 
 class _Layout:
@@ -502,13 +602,6 @@ class _Layout:
 
     def __eq__(self, other):
         return isinstance(other, _Layout) and self._items == other._items
-
-
-_MD_KEYS = ("cu_q", "cu_kv", "pi", "seq", "dist", "req_seq", "req_pi", "req_cuq", "req_dist")
-
-
-def _md_named(prefix, arrays):
-    return [(prefix + k, a) for k, a in zip(_MD_KEYS, arrays)]
 
 
 def _pack(named, dtype):
@@ -533,22 +626,6 @@ def _empty_backend_treedef(backend):
         backend.forward_metadata = saved
     assert not leaves, f"backend carries array state besides metadata: {len(leaves)} leaves"
     return treedef
-
-
-class _BatchView:
-    """Attribute overlay over a ModelWorkerBatch for metadata builders."""
-
-    def __init__(self, base, **overrides):
-        self._base = base
-        self.__dict__.update(overrides)
-
-    def __getattr__(self, name):
-        return getattr(self._base, name)
-
-
-class _SpecView:
-    def __init__(self, **kw):
-        self.__dict__.update(kw)
 
 
 def _pad_rows(arr, n, fill):

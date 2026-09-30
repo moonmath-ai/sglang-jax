@@ -270,33 +270,38 @@ class MLAAttentionBackend(AttentionBackend):
             base += aligned
         return pages, len(cache_loc) // self.page_size
 
-    def _virtual_decode_arrays(
-        self, slot_pages, kv_lens: np.ndarray, virtual_slot: np.ndarray, page_capacity: int
+    def _region_layout_arrays(
+        self, slot_pages, virtual_slot: np.ndarray, n_valid: int, page_capacity: int
     ) -> tuple[np.ndarray, ...]:
-        """Host arrays ``(cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution)`` of a
-        decode batch where virtual seq v attends ``kv_lens[v]`` tokens of request
-        ``virtual_slot[v]``'s pages. Valid virtual seqs must form a prefix."""
-        num_seqs = len(kv_lens)
-        n_pages = cdiv(kv_lens, self.page_size).astype(np.int64)
+        """Host ``(cu_q_lens, cu_kv_lens, page_indices, distribution)`` of a decode batch whose
+        virtual seq v maps to request ``virtual_slot[v]``'s *allocated* page region.
+
+        The layout depends only on allocations, not on lengths: the kernels use
+        ``cu_kv_lens[v]`` to locate a sequence's first page and take its length from
+        ``seq_lens``, so a region may extend past the live tokens. That keeps the layout
+        host-computable when lengths live on device (overlap schedule). Valid virtual seqs
+        (the first ``n_valid``) must form a prefix; padding seqs get empty regions.
+        """
+        num_seqs = len(virtual_slot)
+        n_pages = np.zeros(num_seqs, dtype=np.int64)
+        for v in range(n_valid):
+            n_pages[v] = len(slot_pages[virtual_slot[v]])
         assert int(n_pages.sum()) <= page_capacity, (int(n_pages.sum()), page_capacity)
         page_indices = np.zeros(page_capacity, dtype=np.int32)
         off = 0
-        for v in range(num_seqs):
+        for v in range(n_valid):
             n = int(n_pages[v])
-            if n:
-                page_indices[off : off + n] = slot_pages[virtual_slot[v]][:n]
-                off += n
+            page_indices[off : off + n] = slot_pages[virtual_slot[v]]
+            off += n
         cu_kv_lens = np.zeros(num_seqs + 1, dtype=np.int32)
         cu_kv_lens[1:] = np.cumsum(n_pages * self.page_size)
         cu_q_lens = np.arange(num_seqs + 1, dtype=np.int32)
-        n_valid = int(np.sum(kv_lens > 0))
-        assert np.all(kv_lens[:n_valid] > 0) and np.all(kv_lens[n_valid:] == 0)
         distribution = np.array([n_valid, n_valid, n_valid], dtype=np.int32)
-        return cu_q_lens, cu_kv_lens, page_indices, kv_lens.astype(np.int32), distribution
+        return cu_q_lens, cu_kv_lens, page_indices, distribution
 
     def metadata_from_arrays(self, arrays, *, upload: bool = True) -> MLAAttentionMetadata:
-        """Wrap ``_virtual_decode_arrays`` output (5 arrays), optionally followed by the
-        4 ``spec_req_*`` request-layout arrays (host, or already on device)."""
+        """Wrap ``(cu_q, cu_kv, page_indices, seq_lens, distribution)``, optionally followed by
+        the 4 ``spec_req_*`` request-layout arrays (host, or already on device)."""
         if upload:
             arrays = device_array(
                 tuple(arrays),
@@ -304,18 +309,46 @@ class MLAAttentionBackend(AttentionBackend):
             )
         return MLAAttentionMetadata(*arrays)
 
-    def _spec_request_layout_arrays(self, slot_pages, committed, valid, T, pages_per_seq):
-        """Request-layout view of a T-token chain: seq_len = S + T, T causal queries."""
-        bs = len(committed)
-        seq = np.where(valid, committed + T, 0).astype(np.int32)
-        pi = np.zeros((bs, pages_per_seq), dtype=np.int32)
-        for r in np.nonzero(valid)[0]:
-            n = int(cdiv(int(seq[r]), self.page_size))
-            pi[r, :n] = slot_pages[r][:n]
-        cu_q = (np.arange(bs + 1) * T).astype(np.int32)
+    def spec_chain_layout(self, batch: ModelWorkerBatch, T: int) -> dict:
+        """Length-independent host layout of one speculative round (topk=1 chain of T).
+
+        Keys: ``valid`` [bs]; ``chain`` = (cu_q, cu_kv, pi, dist) for TARGET_VERIFY /
+        DRAFT_EXTEND over bs*T virtual sequences; ``req`` = (pi, cu_q, dist) request layout
+        (fixed stride, T causal queries per sequence); ``step`` = (cu_q, cu_kv, pi, dist) for
+        draft decode steps. Lengths are supplied separately (see ``spec_chain_lengths``).
+        """
+        slot_pages, total_pages = self._spec_request_pages(batch)
+        bs = len(batch.seq_lens)
+        valid = np.asarray(batch.seq_lens) > 0
         n_valid = int(valid.sum())
-        dist = np.array([0, 0, n_valid], dtype=np.int32)  # all "mixed": multi-query rows
-        return seq, pi.reshape(-1), cu_q, dist
+        assert np.all(valid[:n_valid]) and not np.any(
+            valid[n_valid:]
+        ), "valid rows must be a prefix"
+        chain = self._region_layout_arrays(
+            slot_pages, np.repeat(np.arange(bs), T), T * n_valid, T * total_pages
+        )
+        pages_per_seq = total_pages // bs  # == the chain layout's len(pi) // num_seqs
+        req_pi = np.zeros((bs, pages_per_seq), dtype=np.int32)
+        for r in range(n_valid):
+            pages = slot_pages[r][:pages_per_seq]
+            req_pi[r, : len(pages)] = pages
+        req = (
+            req_pi.reshape(-1),
+            (np.arange(bs + 1) * T).astype(np.int32),
+            np.array([0, 0, n_valid], dtype=np.int32),  # all "mixed": multi-query rows
+        )
+        step = self._region_layout_arrays(slot_pages, np.arange(bs), n_valid, total_pages)
+        return {"valid": valid, "chain": chain, "req": req, "step": step}
+
+    @staticmethod
+    def spec_chain_lengths(committed, valid, T: int, xp=np):
+        """Lengths for a chain whose committed KV length is ``committed`` (= entry seq_lens - 1):
+        chain virtual seq j of request r attends committed[r] + j + 1 tokens; the request
+        layout holds committed[r] + T. ``xp`` is numpy on host or jax.numpy in-JIT."""
+        j = xp.arange(T, dtype=xp.int32)
+        chain = xp.where(valid[:, None], committed[:, None] + j[None, :] + 1, 0).reshape(-1)
+        req = xp.where(valid, committed + T, 0)
+        return chain.astype(xp.int32), req.astype(xp.int32)
 
     def eagle_forward_metadata_arrays(self, batch: ModelWorkerBatch):
         """Host arrays for TARGET_VERIFY / DRAFT_EXTEND (see get_eagle_forward_metadata)."""
@@ -329,30 +362,22 @@ class MLAAttentionBackend(AttentionBackend):
             committed = seq_lens - (T - 1)
         else:
             raise ValueError(f"Invalid speculative forward mode: {batch.forward_mode}")
-        slot_pages, total_pages = self._spec_request_pages(batch)
-        valid = seq_lens > 0
-        j = np.arange(T, dtype=np.int64)
-        kv_lens = np.where(valid[:, None], committed[:, None] + j[None, :] + 1, 0).reshape(-1)
-        virtual_slot = np.repeat(np.arange(bs), T)
-        virtual = self._virtual_decode_arrays(slot_pages, kv_lens, virtual_slot, T * total_pages)
-        # Same fixed stride as the virtual layout's pages_per_seq (= len(pi) // num_seqs).
-        req = self._spec_request_layout_arrays(
-            slot_pages, committed, valid, T, (T * total_pages) // (T * bs)
-        )
-        return virtual + req
+        layout = self.spec_chain_layout(batch, T)
+        cu_q, cu_kv, pi, dist = layout["chain"]
+        req_pi, req_cuq, req_dist = layout["req"]
+        chain_kv, req_seq = self.spec_chain_lengths(committed, layout["valid"], T)
+        return cu_q, cu_kv, pi, chain_kv, dist, req_seq, req_pi, req_cuq, req_dist
 
     def eagle_multi_step_metadata_arrays(self, batch: ModelWorkerBatch):
         """Host arrays per draft decode step i (kv_len = seq_lens + i)."""
         assert batch.forward_mode == ForwardMode.DECODE
         assert batch.speculative_eagle_topk == 1, "MLA speculative decoding requires topk == 1"
         seq_lens = np.asarray(batch.seq_lens, dtype=np.int64)
-        slot_pages, total_pages = self._spec_request_pages(batch)
-        valid = seq_lens > 0
-        virtual_slot = np.arange(len(seq_lens))
+        layout = self.spec_chain_layout(batch, 1)
+        cu_q, cu_kv, pi, dist = layout["step"]
+        valid = layout["valid"]
         return [
-            self._virtual_decode_arrays(
-                slot_pages, np.where(valid, seq_lens + i, 0), virtual_slot, total_pages
-            )
+            (cu_q, cu_kv, pi, np.where(valid, seq_lens + i, 0).astype(np.int32), dist)
             for i in range(batch.speculative_num_steps)
         ]
 

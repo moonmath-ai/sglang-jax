@@ -141,7 +141,7 @@ class BaseSpecWorker:
             return
         from sgl_jax.srt.speculative.relay_buffer import create_spec_relay_buffers
 
-        hidden_dtype = jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32
+        hidden_dtype = self.target_worker.model_config.dtype
         self.spec_relay_buffers = create_spec_relay_buffers(
             self.mesh,
             self.req_to_token_pool,
@@ -190,6 +190,16 @@ class BaseSpecWorker:
                 "Spec decode-overlap entry only supports decode batches; "
                 "prefill overlap uses forward_batch_speculative_generation()."
             )
+        if self._chain_fused_round is not None:
+            # One-JIT chain round with relay-resident draft state (non-FA backends).
+            self.init_spec_relay_buffers()
+            self._prepare_overlap_sampling_info(model_worker_batch)
+            result = self._chain_fused_round.run(
+                model_worker_batch,
+                self._get_cur_allocate_lens(model_worker_batch),
+                overlap=True,
+            )
+            return result, None
         if not (self._can_use_fused_spec_decode or self._can_use_fused_eagle3_verify):
             raise NotImplementedError(
                 "Spec overlap entry only supports fused linear NEXTN or EAGLE3 decode."
@@ -290,6 +300,13 @@ class BaseSpecWorker:
             self.draft_worker.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
             )
+            if self._chain_fused_round is not None and not self.server_args.disable_overlap_schedule:
+                # Overlap schedule: the next decode round reads its entry state from the relay
+                # (and the scheduler merges this batch before reading its result).
+                self.init_spec_relay_buffers()
+                model_worker_batch.spec_info_padded = self._chain_fused_round.publish_prefill(
+                    model_worker_batch, next_token_ids, model_worker_batch.spec_info_padded
+                )
             # The generic overlap loop waits for the *current* batch to finish
             # enqueueing before it resolves the previous batch.  Fused prefill
             # publishes this event inside spec_prefill(); the recurrent EAGLE
@@ -350,6 +367,10 @@ class BaseSpecWorker:
             if launch_done is not None:
                 launch_done.set()
             return batch_output
+        relay_state = getattr(model_worker_batch.spec_info_padded, "future_indices", None)
+        if self._chain_fused_round is not None and relay_state is not None:
+            # Draft state lives in the relay (overlap schedule), whatever routed us here.
+            return self._chain_fused_round.run(model_worker_batch, cur_allocate_lens, overlap=True)
         if self._chain_fused_round is not None and self._chain_fused_round.supports_batch(
             model_worker_batch
         ):

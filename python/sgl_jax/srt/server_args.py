@@ -2118,8 +2118,9 @@ class ServerArgs:
                 self.speculative_algorithm == "NEXTN"
                 and self.speculative_eagle_topk == 1
                 and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
-                # the fused NEXTN overlap path builds FlashAttention metadata
-                and self.attention_backend == "fa"
+                # FA: draft_extend_fused; MLA-family (GLM-5.3 dsa_sparse): chain_fused_round
+                and self.attention_backend in ("fa", "dsa_sparse", "mla")
+                and (self.attention_backend == "fa" or self.dp_size == 1)
             )
             supports_eagle3_overlap = (
                 self.speculative_algorithm == "EAGLE3"
@@ -2134,7 +2135,7 @@ class ServerArgs:
             if not (supports_nextn_overlap or supports_eagle3_overlap or supports_dflash_overlap):
                 raise ValueError(
                     "Speculative overlap scheduler only supports DFLASH/DSPARK, EAGLE3+FA, "
-                    "or NEXTN+FA with --speculative-eagle-topk=1 and "
+                    "or NEXTN (fa, or dsa_sparse/mla at dp=1) with --speculative-eagle-topk=1 and "
                     "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
                     "Please pass --disable-overlap-schedule for other speculative configs."
                 )
