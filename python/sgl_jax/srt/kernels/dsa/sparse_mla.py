@@ -69,6 +69,28 @@ def compute_topk_pages(
     return jnp.pad(hit_pages, ((0, 0), (0, k_pages_max - k_eff)), constant_values=-1)
 
 
+def page_mask_to_list(mask: jax.Array, width: int) -> tuple[jax.Array, jax.Array]:
+    """``[N, P]`` hit mask -> (ascending hit pages ``[N, width]`` (-1 padded), count ``[N]``).
+
+    A ``P``-wide sort of page ids (``P`` = pages per sequence) replaces sorting the
+    selected tokens/pages themselves; exact when ``P <= width``.
+    """
+    P = mask.shape[-1]
+    big = jnp.iinfo(jnp.int32).max
+    ids = jnp.broadcast_to(jnp.arange(P, dtype=jnp.int32), mask.shape)
+    hits = jnp.sort(jnp.where(mask, ids, big), axis=-1)
+    hits = jnp.where(hits < big, hits, -1)
+    if width > P:
+        hits = jnp.pad(hits, ((0, 0), (0, width - P)), constant_values=-1)
+    return hits[:, :width], jnp.sum(mask, axis=-1).astype(jnp.int32)
+
+
+def pages_to_mask(page_ids: jax.Array, num_pages: int) -> jax.Array:
+    """``[N, M]`` page ids (-1 = none) -> ``[N, num_pages]`` hit mask (dense compare, no sort)."""
+    ar = jnp.arange(num_pages, dtype=page_ids.dtype)
+    return jnp.any(page_ids[:, :, None] == ar[None, None, :], axis=1)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -82,6 +104,7 @@ def compute_topk_pages(
         "vmem_limit_bytes",
         "page_share_group",
         "group_queries",
+        "mask_pages",
     ),
 )
 def sparse_mla_page_level(
@@ -108,6 +131,7 @@ def sparse_mla_page_level(
     vmem_limit_bytes: int | None = None,
     page_share_group: int = 1,
     group_queries: bool = False,
+    mask_pages: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Page-level sparse MLA: dense kernel over only the topk-touched pages.
 
@@ -166,9 +190,27 @@ def sparse_mla_page_level(
         # the middle of topk_pages (compute_topk_pages doesn't know it), and
         # the sp_local layout below assumes hit_pages[:n_hit_c] are all valid.
         raw = topk_pages[..., : k_pages_max - 1]
-        hit_is_valid = (raw >= 0) & (raw != new_page_local[:, None])
-        n_hit_c = jnp.minimum(jnp.sum(hit_is_valid, -1), k_pages_max - 1)
-        hit_pages = jnp.sort(jnp.where(hit_is_valid, raw, jnp.iinfo(jnp.int32).max), axis=-1)
+        mp = pages_per_seq if mask_pages is None else min(mask_pages, pages_per_seq)
+
+        def _sorted():
+            hit_is_valid = (raw >= 0) & (raw != new_page_local[:, None])
+            n = jnp.minimum(jnp.sum(hit_is_valid, -1), k_pages_max - 1)
+            h = jnp.sort(jnp.where(hit_is_valid, raw, jnp.iinfo(jnp.int32).max), axis=-1)
+            return h, n.astype(jnp.int32)
+
+        if mp <= k_pages_max - 1:
+            # Hit mask over the sequence's pages + an mp-wide compaction instead of
+            # sorting the (k_pages_max-1)-wide page list. Runtime guard: a sequence
+            # longer than mp pages takes the sort path.
+            def _masked():
+                mask = pages_to_mask(raw, mp)
+                mask &= jnp.arange(mp)[None, :] != new_page_local[:, None]
+                return page_mask_to_list(mask, k_pages_max - 1)
+
+            fits = jnp.max((kv_lens + page_size - 1) // page_size) <= mp
+            hit_pages, n_hit_c = jax.lax.cond(fits, _masked, _sorted)
+        else:
+            hit_pages, n_hit_c = _sorted()
     else:
         # Unique pages via one-hot OR over the k topk positions (page count is
         # bounded by pages_per_seq which is static). Keeps everything jit-static.

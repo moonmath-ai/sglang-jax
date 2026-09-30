@@ -126,3 +126,38 @@ def test_expand_matches_reference():
         jnp.full((1, k_pools), -1, jnp.int32), jnp.asarray([-1]), kpool=KP, k_tokens=topk
     )
     assert (np.asarray(got) == -1).all()
+
+
+def test_pool_page_union_matches_sorted_path():
+    """Page lists from pooled ids (mask + compaction) == sort-based compute_topk_pages."""
+    from sgl_jax.srt.kernels.dsa.sparse_mla import (
+        compute_topk_pages,
+        page_mask_to_list,
+        pages_to_mask,
+    )
+
+    rng = np.random.default_rng(5)
+    topk_tokens, pps = 64, 12
+    E = PS // KP
+    rows, qpos = [], []
+    for q in [3, 130, 700, 1400, 1535, 1000]:
+        n_vis = (q + 1) // KP
+        sel = rng.permutation(n_vis)[: topk_tokens // KP] if n_vis else np.array([], int)
+        r = np.full(topk_tokens // KP, -1, np.int32)
+        r[: len(sel)] = sel
+        rows.append(r)
+        qpos.append(q)
+    pools = jnp.asarray(np.stack(rows))
+    qpos = jnp.asarray(qpos, jnp.int32)
+    tok = _kpool_expand(pools, qpos, kpool=KP, k_tokens=topk_tokens)
+    old = np.asarray(compute_topk_pages(tok, page_size=PS, pages_per_seq=pps, k_pages_max=511))
+    pool_pages = jnp.where(pools >= 0, pools // E, -1)
+    new, _ = page_mask_to_list(pages_to_mask(pool_pages, pps), 511)
+    new = np.asarray(new)
+    for i, q in enumerate(np.asarray(qpos)):
+        cur = q // PS  # current-token page: re-appended by both MLA paths
+        o = {int(p) for p in old[i] if p >= 0 and p != cur}
+        n = {int(p) for p in new[i] if p >= 0 and p != cur}
+        assert o == n, (q, sorted(o), sorted(n))
+        got = [int(p) for p in new[i] if p >= 0]
+        assert got == sorted(got)

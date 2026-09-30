@@ -27,7 +27,12 @@ from sgl_jax.srt.kernels.dsa.ref import (
     streamindex_page_topk_ref_grouped,
     streamindex_topk_ref,
 )
-from sgl_jax.srt.kernels.dsa.sparse_mla import compute_topk_pages, sparse_mla_page_level
+from sgl_jax.srt.kernels.dsa.sparse_mla import (
+    compute_topk_pages,
+    page_mask_to_list,
+    pages_to_mask,
+    sparse_mla_page_level,
+)
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import prefill_write_and_attend_ragged
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
     paged_write_back,
@@ -197,9 +202,13 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         skip_offset: int,
         full_slot: dict[int, int],
         index_kpool: int = 1,
+        max_pages_per_seq: int | None = None,
         **mla_kwargs,
     ):
         super().__init__(**mla_kwargs)
+        # Static bound on a sequence's pages (from the server's max_seq_len). The page-table
+        # stride (pages_per_seq) is a padded layout width and can be much larger.
+        self.max_pages_per_seq = max_pages_per_seq
         if index_kpool > 1 and index_topk % index_kpool:
             raise ValueError(f"index_topk={index_topk} must be a multiple of kpool={index_kpool}")
         self.index_kpool = index_kpool
@@ -219,6 +228,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             "skip_offset": self.skip_offset,
             "full_slot": self.full_slot,
             "index_kpool": self.index_kpool,
+            "max_pages_per_seq": self.max_pages_per_seq,
         }
         return children, aux
 
@@ -231,6 +241,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             skip_offset=aux_data["skip_offset"],
             full_slot=aux_data["full_slot"],
             index_kpool=aux_data["index_kpool"],
+            max_pages_per_seq=aux_data.get("max_pages_per_seq"),
             num_attn_heads=aux_data["num_attn_heads"],
             kv_lora_rank=aux_data["kv_lora_rank"],
             qk_nope_head_dim=aux_data["qk_nope_head_dim"],
@@ -609,6 +620,11 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         )
         return idx_cache, topk, (topk_pages if compute_pages else None)
 
+    def _mask_pages(self, pages_per_seq: int) -> int:
+        """Width of a per-sequence page mask: min(layout stride, max pages per sequence)."""
+        cap = getattr(self, "max_pages_per_seq", None)
+        return pages_per_seq if cap is None else min(pages_per_seq, cap)
+
     def _kpool_index_local(
         self,
         q_,
@@ -674,13 +690,29 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         topk = _kpool_expand(
             pools, seq_lens_[: q_.shape[0]] - 1, kpool=kp, k_tokens=self.index_topk
         )
-        topk_pages = (
-            compute_topk_pages(
+        if not compute_pages:
+            topk_pages = jnp.full((topk.shape[0], 1), -1, jnp.int32)
+        elif self._mask_pages(pages_per_seq) <= 511:
+            # A pool never straddles a page (page_size % kpool == 0), so the hit pages are
+            # those of the selected pools (the tail lies in the current token's page, which
+            # the MLA kernels always attend): a page mask over the sequence's pages and a
+            # pages_per_seq-wide compaction replace sorting the 2051 selected tokens.
+            mp = self._mask_pages(pages_per_seq)
+            pool_pages = jnp.where(pools >= 0, pools // E, -1)
+            # max_seq_len does not cap request length, so guard at runtime: any sequence
+            # longer than mp pages takes the exact sort path.
+            fits = jnp.max((seq_lens_ + page_size - 1) // page_size) <= mp
+            topk_pages = jax.lax.cond(
+                fits,
+                lambda: page_mask_to_list(pages_to_mask(pool_pages, mp), 511)[0],
+                lambda: compute_topk_pages(
+                    topk, page_size=self.page_size, pages_per_seq=pages_per_seq, k_pages_max=511
+                ),
+            )
+        else:
+            topk_pages = compute_topk_pages(
                 topk, page_size=self.page_size, pages_per_seq=pages_per_seq, k_pages_max=511
             )
-            if compute_pages
-            else jnp.full((topk.shape[0], 1), -1, jnp.int32)
-        )
         return cache_out, topk, topk_pages
 
     def _run_sparse(
@@ -746,6 +778,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 pages_per_seq=pages_per_seq,
                 kv_lora_rank=self.kv_lora_rank,
                 k_pages_max=k_pages_max,
+                mask_pages=self._mask_pages(pages_per_seq),
                 vmem_limit_bytes=self.vmem_limit_bytes,
                 page_share_group=page_share_group,
                 group_queries=group_queries,
