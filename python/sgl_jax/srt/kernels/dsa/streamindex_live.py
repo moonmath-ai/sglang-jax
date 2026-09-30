@@ -207,7 +207,15 @@ def streamindex_topk_live(
     )
 
 
-@jax.jit(static_argnames=("k", "queries_per_seq", "pages_per_seq", "num_kv_pages_per_block"))
+@jax.jit(
+    static_argnames=(
+        "k",
+        "queries_per_seq",
+        "pages_per_seq",
+        "num_kv_pages_per_block",
+        "compression_ratio",
+    )
+)
 def streamindex_topk_live_multiq(
     q: jax.Array,
     weights: jax.Array,
@@ -219,6 +227,7 @@ def streamindex_topk_live_multiq(
     queries_per_seq: int,
     pages_per_seq: int,
     num_kv_pages_per_block: int = 64,
+    compression_ratio: int = 1,
 ) -> jax.Array:
     """Live-context top-k for sequences that each end in ``queries_per_seq`` causal queries.
 
@@ -248,10 +257,39 @@ def streamindex_topk_live_multiq(
     if cache_kv.dtype != jnp.bfloat16 or page_size % 2:
         raise ValueError("Live indexer requires BF16 cache and an even page size")
     buckets = _page_buckets(pages_per_seq, min(16, num_kv_pages_per_block))
-    limits = jnp.asarray([pages * page_size for pages in buckets], jnp.int32)
+    limits = jnp.asarray([pages * page_size * compression_ratio for pages in buckets], jnp.int32)
     cache4d = cache_kv.reshape(cache_kv.shape[0], page_size // 2, 2, cache_kv.shape[-1])
     if batch == 0:
         return jnp.full((0, k), -1, jnp.int32)
+
+    if _SINGLE_PASS:
+        # Fixed-stride page table: each request's window is a static slice.
+        bucket = jnp.minimum(jnp.sum(jnp.max(seq_lens) > limits, dtype=jnp.int32), len(buckets) - 1)
+        tbl = page_indices[: batch * pages_per_seq].reshape(batch, pages_per_seq)
+        cuq = jnp.arange(batch + 1, dtype=jnp.int32) * Tq
+        dist = jnp.asarray([0, 0, batch], jnp.int32)  # all mixed: Tq queries per seq
+
+        def _branch(bp):
+            def f(_):
+                return streamindex_topk(
+                    q,
+                    weights,
+                    cache4d,
+                    seq_lens,
+                    tbl[:, :bp].reshape(-1),
+                    cuq,
+                    dist,
+                    k=k,
+                    compression_ratio=compression_ratio,
+                    num_kv_pages_per_block=min(bp, num_kv_pages_per_block),
+                    num_queries_per_block=Tq,
+                )
+
+            return f
+
+        sel = jax.lax.switch(bucket, [_branch(bp) for bp in buckets], None)
+        keep = jnp.repeat(seq_lens > 0, Tq)[:, None]
+        return jnp.where(keep, sel, -1)
 
     q = q.reshape(batch, Tq, *q.shape[1:])
     weights = weights.reshape(batch, Tq, weights.shape[-1])
@@ -281,6 +319,7 @@ def streamindex_topk_live_multiq(
     )
     bucket_branches = []
     for bucket_pages in buckets:
+
         def score_and_select(args, bucket_pages=bucket_pages):
             q_group, w_group, lengths_group, starts_group, group_order, out = args
             # Contiguous per-row windows of the (padded) page table: dynamic slices are
@@ -300,10 +339,9 @@ def streamindex_topk_live_multiq(
                 group_cuq,
                 group_dist,
                 k=k,
-                compression_ratio=1,
+                compression_ratio=compression_ratio,
                 num_kv_pages_per_block=min(bucket_pages, num_kv_pages_per_block),
                 num_queries_per_block=Tq,
-                topk_backend="chunked",
             ).reshape(group_size, Tq, k)
             old = out[group_order]
             keep = (lengths_group > 0)[:, None, None]
@@ -326,8 +364,14 @@ def streamindex_topk_live_multiq(
         out = jax.lax.switch(
             bucket,
             tuple(bucket_branches),
-            (q[group_order], weights[group_order], lengths_group, page_starts[group_order],
-             group_order, out),
+            (
+                q[group_order],
+                weights[group_order],
+                lengths_group,
+                page_starts[group_order],
+                group_order,
+                out,
+            ),
         )
         return cursor + run_size, out
 
