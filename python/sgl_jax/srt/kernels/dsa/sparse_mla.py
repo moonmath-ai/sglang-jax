@@ -335,6 +335,111 @@ def sparse_mla_page_level(
     static_argnames=(
         "sm_scale",
         "page_size",
+        "queries_per_seq",
+        "kv_lora_rank",
+        "k_pages_max",
+        "vmem_limit_bytes",
+    ),
+)
+def sparse_mla_chain_request_level(
+    ql_nope: jax.Array,
+    q_pe: jax.Array,
+    new_kv_c: jax.Array,
+    new_k_pe: jax.Array,
+    cache_kv: jax.Array,
+    topk_pages: jax.Array,
+    req_seq_lens: jax.Array,
+    req_page_indices: jax.Array,
+    req_distribution: jax.Array,
+    *,
+    sm_scale: float,
+    page_size: int,
+    queries_per_seq: int,
+    kv_lora_rank: int,
+    k_pages_max: int = 512,
+    vmem_limit_bytes: int | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Page-level sparse MLA for speculative chains, one causal ``Tq``-query pass per request.
+
+    ``sparse_mla_page_level`` runs each of a request's ``Tq`` chain tokens as its own
+    one-query sequence, so the request's hit pages are read ``Tq`` times. Here each request
+    attends the union of its queries' hit pages once, with the chain's own page(s) appended
+    last so the chain tokens are the final ``Tq`` positions and the ragged kernel's causal
+    rule (query ``i`` sees ``kv_len - Tq + i`` and earlier) applies. NoPE MLA is position
+    free, so page order is irrelevant. Same page-level (superset) semantics as the per-query
+    path; each query may additionally see pages selected by its siblings.
+
+    ``topk_pages`` [B*Tq, k] seq-local hit pages per chain token (-1 padded, request-major);
+    ``req_seq_lens`` [B] = committed + Tq; ``req_page_indices`` fixed stride [B * pps].
+    Returns ``(o_latent [B*Tq, H, kv_lora_rank], updated cache)``.
+    """
+    Tq = queries_per_seq
+    B = req_seq_lens.shape[0]
+    pps = req_page_indices.shape[0] // B
+    big = jnp.iinfo(jnp.int32).max
+
+    last = jnp.maximum(req_seq_lens - 1, 0)
+    first_chain_page = jnp.maximum(req_seq_lens - Tq, 0) // page_size
+    last_chain_page = last // page_size
+    n_chain_pages = last_chain_page - first_chain_page + 1  # 1 or 2
+
+    hits = topk_pages.reshape(B, -1)
+    ok = (hits >= 0) & (hits < first_chain_page[:, None])
+    hits = jnp.sort(jnp.where(ok, hits, big), axis=-1)
+    uniq = jnp.concatenate(
+        [hits[:, :1] < big, (hits[:, 1:] != hits[:, :-1]) & (hits[:, 1:] < big)], axis=-1
+    )
+    # Compact the unique pages to the front (ascending); cap leaves room for the chain pages.
+    n_hit = jnp.minimum(jnp.sum(uniq, axis=-1), k_pages_max - 2)
+    hit_pages = jnp.sort(jnp.where(uniq, hits, big), axis=-1)[:, : k_pages_max - 2]
+
+    col = jnp.arange(k_pages_max)[None, :]
+    chain_col = col - n_hit[:, None]  # 0 / 1 -> first / second chain page
+    local = jnp.where(
+        col < n_hit[:, None],
+        jnp.pad(hit_pages, ((0, 0), (0, 2)), constant_values=0),
+        first_chain_page[:, None] + chain_col,
+    )
+    used = col < (n_hit + n_chain_pages)[:, None]
+    active = (req_seq_lens > 0)[:, None]
+    local = jnp.clip(local, 0, pps - 1)
+    phys = jnp.where(
+        used & active,
+        req_page_indices[jnp.arange(B)[:, None] * pps + local],
+        cache_kv.shape[0] - 1,
+    )
+    sp_kv_len = jnp.where(
+        req_seq_lens > 0,
+        n_hit * page_size + (last - first_chain_page * page_size) + 1,
+        0,
+    ).astype(jnp.int32)
+    sp_cu_q = jnp.arange(B + 1, dtype=jnp.int32) * Tq
+    sp_cu_kv = jnp.arange(B + 1, dtype=jnp.int32) * (k_pages_max * page_size)
+
+    o, cache_out = mla_ragged_paged_attention(
+        ql_nope,
+        q_pe,
+        new_kv_c,
+        new_k_pe,
+        cache_kv,
+        sp_kv_len,
+        phys.reshape(-1),
+        sp_cu_q,
+        sp_cu_kv,
+        req_distribution,
+        sm_scale=sm_scale,
+        sliding_window=None,
+        soft_cap=None,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+    return o[..., :kv_lora_rank], cache_out
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "sm_scale",
+        "page_size",
         "pages_per_seq",
         "kv_lora_rank",
         "num_kv_pages_per_block",

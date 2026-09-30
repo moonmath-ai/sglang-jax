@@ -31,6 +31,7 @@ from sgl_jax.srt.kernels.dsa.sparse_mla import (
     compute_topk_pages,
     page_mask_to_list,
     pages_to_mask,
+    sparse_mla_chain_request_level,
     sparse_mla_page_level,
 )
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import prefill_write_and_attend_ragged
@@ -79,6 +80,12 @@ _INDEXER_KERNEL = os.environ.get("DSA_INDEXER_KERNEL", "0") == "1"
 # [T, max_kv] token scores in HBM — the dominant HLO-temporaries term at long
 # context. Same selection semantics as the ref (parity-gated). Default OFF.
 _INDEXER_KERNEL_PREFILL = os.environ.get("DSA_INDEXER_KERNEL_PREFILL", "0") == "1"
+# Speculative chains (TARGET_VERIFY / DRAFT_EXTEND): run sparse MLA as one causal
+# multi-query pass per request over the union of its chain tokens' hit pages instead of
+# one virtual sequence per token (which re-reads the request's pages per token).
+_CHAIN_REQUEST_MLA = os.environ.get("DSA_CHAIN_REQUEST_MLA", "1") == "1"
+
+
 # bkv block of 64 pages (4K tokens @ page 64) benched fastest across
 # B=8..64, ctx 8K..128K on v7x/v6e.
 _INDEXER_KERNEL_KV_PAGES_PER_BLOCK = 64
@@ -856,6 +863,13 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         page_share_group: int = 1,
         group_queries: bool = False,
     ):
+        if (
+            _CHAIN_REQUEST_MLA
+            and topk_pages is not None
+            and getattr(md, "spec_req_seq_lens", None) is not None
+            and _PAGE_TOPK_BUDGET == 0
+        ):
+            return self._run_sparse_chain(ql, qpe, kvc, kpe, cache, topk_pages, sm_scale, dpa, md)
         has_pages = topk_pages is not None
         if not has_pages:
             topk_pages = jnp.full((topk.shape[0], 1), -1, jnp.int32)
@@ -923,6 +937,43 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             md.cu_q_lens,
             md.cu_kv_lens,
             md.distribution,
+        )
+
+    def _run_sparse_chain(self, ql, qpe, kvc, kpe, cache, topk_pages, sm_scale, dpa, md):
+        """Speculative chain sparse MLA, one causal multi-query pass per request."""
+        n_req = md.spec_req_seq_lens.shape[0]
+        Tq = ql.shape[0] // n_req
+
+        def _run(ql_, qpe_, kvc_, kpe_, cache_, tpages_, req_seq_, req_pi_, req_dist_):
+            page_size = cache_.shape[1] * cache_.shape[2]
+            return sparse_mla_chain_request_level(
+                ql_, qpe_, kvc_, kpe_, cache_, tpages_, req_seq_, req_pi_, req_dist_,
+                sm_scale=float(sm_scale),
+                page_size=page_size,
+                queries_per_seq=Tq,
+                kv_lora_rank=self.kv_lora_rank,
+                k_pages_max=512,
+                vmem_limit_bytes=self.vmem_limit_bytes,
+            )
+
+        return jax.shard_map(
+            _run,
+            in_specs=(
+                P(dpa, "tensor", None),
+                P(dpa, "tensor", None),
+                P(dpa, None),
+                P(dpa, None),
+                P(dpa, None, None, None),
+                P(dpa, None),
+                P(dpa),
+                P(dpa),
+                P(dpa),
+            ),
+            out_specs=(P(dpa, "tensor", None), P(dpa, None, None, None)),
+            check_vma=False,
+        )(
+            ql, qpe, kvc, kpe, cache, topk_pages,
+            md.spec_req_seq_lens, md.spec_req_page_indices, md.spec_req_distribution,
         )
 
     def _maybe_index_prefill_pages(
