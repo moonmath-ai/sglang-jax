@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.kernels.kda.chain_verify import kda_chain_verify
 from sgl_jax.srt.kernels.kda import (
     chunk_kda,
     is_mega_kda_layout_supported,
@@ -19,6 +20,10 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
 from sgl_jax.srt.layers.attention.linear.short_convolution import short_convolution
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.profiling_utils import named_scope
+
+# TARGET_VERIFY: fused Pallas chain recurrence (kernels/kda/chain_verify.py); 0 restores
+# the per-step XLA loop.
+_KDA_CHAIN_KERNEL = os.environ.get("SGLANG_JAX_KDA_CHAIN_KERNEL", "1") == "1"
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -572,55 +577,12 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         beta = b.reshape(bs * T, layer.num_q_heads)
         scale = layer.scale
 
-        def _chain_kernel(q_d, k_d, v_d, g_d, beta_d, h0):
-            # [B*T, H, *] -> [B, T, H, *]
-            B = h0.shape[0]
-            q_d, k_d, v_d, g_d = (x.reshape(B, T, *x.shape[1:]) for x in (q_d, k_d, v_d, g_d))
-            beta_d = beta_d.reshape(B, T, -1)
-            h = h0
-            outs, states = [], []
-            for t in range(T):
-                o, h = naive_recurrent_kda(
-                    q_d[:, t : t + 1],
-                    k_d[:, t : t + 1],
-                    v_d[:, t : t + 1],
-                    g_d[:, t : t + 1],
-                    beta_d[:, t : t + 1],
-                    scale=scale,
-                    initial_state=h,
-                    output_final_state=True,
-                )
-                h = h.astype(h0.dtype)
-                outs.append(o[:, 0])
-                states.append(h)
-            o = jnp.stack(outs, axis=1)
-            return o.reshape(B * T, *o.shape[2:]), jnp.stack(states, axis=1)
+        spec_ssm_spec = P("data", None, "tensor", None, None)
 
-        output, step_ssm = jax.shard_map(
-            _chain_kernel,
-            mesh=self.mesh,
-            in_specs=(
-                P("data", "tensor", None),  # q [B*T, H, K]
-                P("data", "tensor", None),  # k
-                P("data", "tensor", None),  # v
-                P("data", "tensor", None),  # g
-                P("data", "tensor"),  # beta [B*T, H]
-                P("data", "tensor", None, None),  # h0 [B, H, K, V]
-            ),
-            out_specs=(
-                P("data", "tensor", None),  # o [B*T, H, V]
-                P("data", None, "tensor", None, None),  # states [B, T, H, K, V]
-            ),
-            check_vma=False,
-        )(q, k, v, g, beta, ssm_states)
-
-        # Scratch rows are batch positions, not recurrent slots: one contiguous write per
-        # layer instead of a gather + scatter. The commit maps row b -> slot idx[b].
         def _write_rows(buf, val):
             assert val.shape[0] <= buf.shape[0], (val.shape, buf.shape)
             return jax.lax.dynamic_update_slice_in_dim(buf, val.astype(buf.dtype), 0, axis=0)
 
-        spec_ssm_spec = P("data", None, "tensor", None, None)
         new_spec_conv = jax.shard_map(
             _write_rows,
             mesh=self.mesh,
@@ -628,13 +590,93 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             out_specs=spec_conv_spec,
             check_vma=False,
         )(spec_conv_full, step_conv)
-        new_spec_ssm = jax.shard_map(
-            _write_rows,
-            mesh=self.mesh,
-            in_specs=(spec_ssm_spec, spec_ssm_spec),
-            out_specs=spec_ssm_spec,
-            check_vma=False,
-        )(spec_ssm_full, step_ssm)
+
+        if _KDA_CHAIN_KERNEL:
+            # Fused Pallas recurrence: state stays in VMEM across the chain; each step's
+            # state is written straight into the verify scratch rows (in place).
+            def _fused_chain(q_d, k_d, v_d, g_d, beta_d, h0, st):
+                B = h0.shape[0]
+                f32 = jnp.float32
+
+                def bhtd(x):  # [B*T, H, D] -> [B, H, T, D]
+                    return jnp.transpose(x.reshape(B, T, *x.shape[1:]), (0, 2, 1, 3))
+
+                def bhkt(x):  # [B*T, H, D] -> [B, H, D, T] (per-step columns)
+                    return jnp.transpose(x.reshape(B, T, *x.shape[1:]), (0, 2, 3, 1))
+
+                qs = q_d.astype(f32) * scale
+                kb = k_d.astype(f32) * beta_d.astype(f32)[..., None]
+                o, st = kda_chain_verify(
+                    bhkt(qs), bhkt(k_d), bhkt(kb), bhtd(v_d), bhkt(g_d), h0, st
+                )
+                o = jnp.transpose(o, (0, 2, 1, 3))
+                return o.reshape(B * T, *o.shape[2:]), st
+
+            output, new_spec_ssm = jax.shard_map(
+                _fused_chain,
+                mesh=self.mesh,
+                in_specs=(
+                    P("data", "tensor", None),  # q [B*T, H, K]
+                    P("data", "tensor", None),  # k
+                    P("data", "tensor", None),  # v
+                    P("data", "tensor", None),  # g
+                    P("data", "tensor"),  # beta [B*T, H]
+                    P("data", "tensor", None, None),  # h0 [B, H, K, V]
+                    spec_ssm_spec,  # scratch [R, T, H, K, V]
+                ),
+                out_specs=(P("data", "tensor", None), spec_ssm_spec),
+                check_vma=False,
+            )(q, k, v, g, beta, ssm_states, spec_ssm_full)
+        else:
+            def _chain_kernel(q_d, k_d, v_d, g_d, beta_d, h0):
+                # [B*T, H, *] -> [B, T, H, *]
+                B = h0.shape[0]
+                q_d, k_d, v_d, g_d = (x.reshape(B, T, *x.shape[1:]) for x in (q_d, k_d, v_d, g_d))
+                beta_d = beta_d.reshape(B, T, -1)
+                h = h0
+                outs, states = [], []
+                for t in range(T):
+                    o, h = naive_recurrent_kda(
+                        q_d[:, t : t + 1],
+                        k_d[:, t : t + 1],
+                        v_d[:, t : t + 1],
+                        g_d[:, t : t + 1],
+                        beta_d[:, t : t + 1],
+                        scale=scale,
+                        initial_state=h,
+                        output_final_state=True,
+                    )
+                    h = h.astype(h0.dtype)
+                    outs.append(o[:, 0])
+                    states.append(h)
+                o = jnp.stack(outs, axis=1)
+                return o.reshape(B * T, *o.shape[2:]), jnp.stack(states, axis=1)
+
+            output, step_ssm = jax.shard_map(
+                _chain_kernel,
+                mesh=self.mesh,
+                in_specs=(
+                    P("data", "tensor", None),  # q [B*T, H, K]
+                    P("data", "tensor", None),  # k
+                    P("data", "tensor", None),  # v
+                    P("data", "tensor", None),  # g
+                    P("data", "tensor"),  # beta [B*T, H]
+                    P("data", "tensor", None, None),  # h0 [B, H, K, V]
+                ),
+                out_specs=(
+                    P("data", "tensor", None),  # o [B*T, H, V]
+                    P("data", None, "tensor", None, None),  # states [B, T, H, K, V]
+                ),
+                check_vma=False,
+            )(q, k, v, g, beta, ssm_states)
+
+            new_spec_ssm = jax.shard_map(
+                _write_rows,
+                mesh=self.mesh,
+                in_specs=(spec_ssm_spec, spec_ssm_spec),
+                out_specs=spec_ssm_spec,
+                check_vma=False,
+            )(spec_ssm_full, step_ssm)
 
         return output.reshape(output.shape[0], -1), (
             ssm_full,
