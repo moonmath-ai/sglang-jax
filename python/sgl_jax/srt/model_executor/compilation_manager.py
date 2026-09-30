@@ -160,6 +160,7 @@ class CompilationManager:
         # Backends may request decode variants per pages-per-seq bucket (MSA);
         # None keeps one decode shape per bs. Shared by warmup and AOT export.
         self.decode_page_buckets = getattr(attn_backend, "decode_page_buckets", None)
+        self.speculative_decoding = server_args.speculative_algorithm is not None
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
@@ -199,6 +200,9 @@ class CompilationManager:
     def _compute_bs_buckets(self, user_paddings: list[int] | None) -> list[int]:
         bs_list = user_paddings if user_paddings is not None else PRECOMPILE_DEFAULT_BS_PADDINGS
         is_fused_moe = self.moe_backend in ("fused", "fused_v2")
+        # FusedEPMoEV2 pads non-launchable token counts itself, so speculative decode
+        # (whose forwards carry bs * draft_tokens or bs tokens) may use small bs buckets.
+        allow_small_fused_bs = self.moe_backend == "fused_v2" and self.speculative_decoding
         min_fused_bs = self.tp_size * 2
         if is_fused_moe and self.max_padded_batch_size < min_fused_bs:
             raise ValueError(
@@ -211,7 +215,7 @@ class CompilationManager:
         for bs in bs_list:
             if (
                 bs <= self.max_padded_batch_size
-                and (not is_fused_moe or bs >= min_fused_bs)
+                and (not is_fused_moe or allow_small_fused_bs or bs >= min_fused_bs)
                 and bs >= self.dp_size
             ):
                 buckets.append(bs)

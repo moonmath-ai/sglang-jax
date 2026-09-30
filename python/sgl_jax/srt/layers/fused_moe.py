@@ -556,6 +556,15 @@ class FusedEPMoE(nnx.Module):
         return output
 
 
+def _fused_ep_launchable_tokens(num_tokens: int, ep_size: int) -> int:
+    """Smallest token count >= num_tokens the fused EP-MoE kernel can launch."""
+    if ep_size <= 1:
+        return num_tokens
+    local = -(-num_tokens // ep_size)
+    local = 2 if local <= 2 else (4 if local <= 4 else -(-local // 8) * 8)
+    return local * ep_size
+
+
 class FusedEPMoEV2(FusedEPMoE):
     """V2 fused EP-MoE layer using the Strix-style double-buffer kernel.
 
@@ -580,6 +589,22 @@ class FusedEPMoEV2(FusedEPMoE):
         )
 
         assert hidden_states.ndim == 2
+
+        # The kernel shards tokens over the whole mesh and needs a per-shard batch in
+        # {2, 4, 8k}. Batches that are not launchable (e.g. speculative draft decode at
+        # bs < 2 * ep) are padded with zero-weight copies of token 0's routing, so the
+        # padding activates no additional experts.
+        num_tokens = hidden_states.shape[0]
+        padded_tokens = _fused_ep_launchable_tokens(
+            num_tokens, self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
+        )
+        if padded_tokens != num_tokens:
+            pad = padded_tokens - num_tokens
+            hidden_states = jnp.pad(hidden_states, ((0, pad), (0, 0)))
+            topk_weights = jnp.pad(topk_weights, ((0, pad), (0, 0)))
+            topk_ids = jnp.concatenate(
+                [topk_ids, jnp.broadcast_to(topk_ids[:1], (pad, topk_ids.shape[1]))], axis=0
+            )
 
         w1_scale = self.w1_scale.value if self.w1_scale is not None else None
         w3_scale = self.w3_scale.value if self.w3_scale is not None else None
@@ -670,6 +695,10 @@ class FusedEPMoEV2(FusedEPMoE):
         # (('data','tensor') on the scatter dim); without it we fall back to the
         # plain DP layout P('data', None). b79f9951 dropped this arg and hardcoded
         # the DP layout, which silently broke SP for MoE layers — restored here.
+        if padded_tokens != num_tokens:
+            output = jax.sharding.reshard(
+                output, jax.sharding.NamedSharding(self.mesh, P("data", None))
+            )[:num_tokens]
         if out_sharding is not None:
             output = jax.sharding.reshard(output, out_sharding)
         else:
