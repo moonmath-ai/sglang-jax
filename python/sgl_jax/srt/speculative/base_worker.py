@@ -14,6 +14,8 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 
+_SPEC_TIMING = os.getenv("SGL_JAX_SPEC_TIMING") == "1"
+
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.managers.tp_worker import ModelWorker
@@ -106,6 +108,18 @@ class BaseSpecWorker:
         )
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
+
+        # One-JIT decode round for topk=1 chains on MLA-family backends (see
+        # chain_fused_round.py); the generic draft/verify/draft-extend loop stays the fallback.
+        self._chain_fused_round = None
+        if os.getenv("SGL_JAX_DISABLE_CHAIN_FUSED_ROUND") != "1":
+            from sgl_jax.srt.speculative.chain_fused_round import (
+                ChainFusedRound,
+                can_use_chain_fused_round,
+            )
+
+            if can_use_chain_fused_round(self):
+                self._chain_fused_round = ChainFusedRound(self)
 
         (
             self.precompile_token_paddings,
@@ -336,9 +350,59 @@ class BaseSpecWorker:
             if launch_done is not None:
                 launch_done.set()
             return batch_output
+        if self._chain_fused_round is not None and self._chain_fused_round.supports_batch(
+            model_worker_batch
+        ):
+            if _SPEC_TIMING:
+                import logging
+                import time
+
+                t0 = time.perf_counter()
+                out = self._chain_fused_round.run(model_worker_batch, cur_allocate_lens)
+                logging.getLogger(__name__).info(
+                    "fused spec round bs=%d: %.1fms",
+                    len(model_worker_batch.seq_lens),
+                    (time.perf_counter() - t0) * 1e3,
+                )
+                return out
+            return self._chain_fused_round.run(model_worker_batch, cur_allocate_lens)
+        if _SPEC_TIMING:
+            return self._timed_spec_decode_round(model_worker_batch, cur_allocate_lens)
         self.draft_worker.draft(model_worker_batch)
         batch_output = self.verify(model_worker_batch, cur_allocate_lens)
         self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
+        launch_done = getattr(model_worker_batch, "launch_done", None)
+        if launch_done is not None:
+            launch_done.set()
+        return batch_output
+
+    def _timed_spec_decode_round(self, model_worker_batch, cur_allocate_lens):
+        """SGL_JAX_SPEC_TIMING=1: synchronize after each phase and log its wall time."""
+        import logging
+        import time
+
+        def _sync():
+            jax.block_until_ready(
+                (
+                    self.target_worker.model_runner.memory_pools,
+                    self.draft_worker.draft_model_runner.memory_pools,
+                )
+            )
+
+        t0 = time.perf_counter()
+        self.draft_worker.draft(model_worker_batch)
+        _sync()
+        t1 = time.perf_counter()
+        batch_output = self.verify(model_worker_batch, cur_allocate_lens)
+        _sync()
+        t2 = time.perf_counter()
+        self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
+        _sync()
+        t3 = time.perf_counter()
+        logging.getLogger(__name__).info(
+            "spec round bs=%d: draft=%.1fms verify=%.1fms draft_extend=%.1fms",
+            len(model_worker_batch.seq_lens), (t1 - t0) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3,
+        )
         launch_done = getattr(model_worker_batch, "launch_done", None)
         if launch_done is not None:
             launch_done.set()

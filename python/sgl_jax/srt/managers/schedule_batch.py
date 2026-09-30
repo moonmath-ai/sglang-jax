@@ -2810,6 +2810,7 @@ class ScheduleBatch:
             total_bs,
             mesh=self.mesh,
             legacy_host_scatter=legacy_eagle3_non_overlap,
+            device_put_ids=self.enable_overlap,
         )
         # Per-rank out_cache_loc chunks (set in spec prepare_for_decode) have
         # variable length (∝ accept_len). DP-segment: pad each to max_len with
@@ -2900,6 +2901,7 @@ class ScheduleBatch:
         total_bs: int,
         mesh: mesh_lib.Mesh = None,
         legacy_host_scatter: bool = False,
+        device_put_ids: bool = True,
     ):
         """Scatter global-flat spec_info arrays into DP-padded ``(total_bs, …)``.
 
@@ -2972,7 +2974,8 @@ class ScheduleBatch:
                 return None
             out = np.zeros((total_bs,) + a.shape[1:], dtype=a.dtype)
             out[selector] = a
-            if data_sharded and mesh is not None:
+            # Without the overlap schedule the spec worker consumes these on host.
+            if data_sharded and mesh is not None and device_put_ids:
                 from jax.sharding import NamedSharding
                 from jax.sharding import PartitionSpec as P
 
