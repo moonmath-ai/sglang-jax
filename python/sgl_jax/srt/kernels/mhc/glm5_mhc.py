@@ -18,7 +18,7 @@ Math is exactly ``Glm5NextHC._mix`` / ``post`` (f32 everywhere):
 
 Kernel design (pre):
   * Tokens are tiled ``bt`` rows per program; the whole hc*D feature row stays in VMEM.
-  * ``fn`` is re-laid-out once per call (XLA side) as ``fn_t [n_pad, hc*D]``: every gate group
+  * ``fn`` is re-laid-out (XLA side; once at load time via ``prepared``, else per call) as ``fn_t [n_pad, hc*D]``: every gate group
     (pre, post, and comb column j for each j) starts on an 8-sublane boundary, so all in-kernel
     slices are tile aligned (n_pad = 8 * (2 + hc) = 48 for hc=4).
   * ``mixT = fn_t . x^T`` (flash-attention style NT matmul) gives the projection with tokens on
@@ -46,6 +46,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+_LANES = 128
 _SLAB = 8  # sublane tile: each gate group occupies one 8-row slab of fn_t / mixT
 _VMEM_LIMIT = 48 * 1024 * 1024
 
@@ -71,14 +72,17 @@ def prepare_fn_t(fn: jax.Array, hc: int) -> jax.Array:
 
 
 def prepare_params(scale: jax.Array, base: jax.Array, hc: int):
-    """-> (scale_rows, base_rows), each [n_pad, 1] f32, matching prepare_fn_t's row layout."""
+    """-> (scale_rows, base_rows), each [n_pad, 128] f32 (value replicated across lanes, so the
+    kernel operand is lane-dense: a [n_pad, 1] operand was re-laid-out on every call), matching
+    prepare_fn_t's row layout."""
     scale = scale.astype(jnp.float32)
     seg = jnp.asarray([0] * hc + [1] * hc + [2] * (hc * hc), jnp.int32)
     rows = _row_index(hc)
     n_pad = _n_pad(hc)
     sc = jnp.zeros((n_pad,), jnp.float32).at[rows].set(scale[seg])
     bs = jnp.zeros((n_pad,), jnp.float32).at[rows].set(base.astype(jnp.float32))
-    return sc.reshape(n_pad, 1), bs.reshape(n_pad, 1)
+    lanes = lambda v: jnp.broadcast_to(v.reshape(n_pad, 1), (n_pad, _LANES))
+    return lanes(sc), lanes(bs)
 
 
 def unpack_state(state: jax.Array, hc: int):
@@ -101,8 +105,23 @@ def _nt(a, b, precision=None):
     )
 
 
-def _pre_kernel(x_ref, fnt_ref, sc_ref, bs_ref, col_ref, state_ref, *, hc, d, iters, hc_eps,
-                eps, n_tokens, bt, precision):
+def _pre_kernel(
+    x_ref,
+    fnt_ref,
+    sc_ref,
+    bs_ref,
+    col_ref,
+    state_ref,
+    *,
+    hc,
+    d,
+    iters,
+    hc_eps,
+    eps,
+    n_tokens,
+    bt,
+    precision,
+):
     x = x_ref[...]
     if x.dtype != fnt_ref.dtype:
         x = x.astype(fnt_ref.dtype)
@@ -117,7 +136,7 @@ def _pre_kernel(x_ref, fnt_ref, sc_ref, bs_ref, col_ref, state_ref, *, hc, d, it
     rinv = jax.lax.rsqrt(ssq * (1.0 / k) + eps)
 
     mix_t = _nt(fnt_ref[...], x, precision) * rinv  # [n_pad, bt]
-    z = mix_t * sc_ref[...] + bs_ref[...]
+    z = mix_t * sc_ref[:, 0:1] + bs_ref[:, 0:1]
 
     s = _SLAB
     pre_s = jax.nn.sigmoid(z[0:s]) + hc_eps
@@ -137,8 +156,9 @@ def _pre_kernel(x_ref, fnt_ref, sc_ref, bs_ref, col_ref, state_ref, *, hc, d, it
     row_ok = jax.lax.broadcasted_iota(jnp.int32, (s, bt), 0) < hc
 
     def col_norm(cs):
-        return [c / (jnp.sum(jnp.where(row_ok, c, 0.0), axis=0, keepdims=True) + hc_eps)
-                for c in cs]
+        return [
+            c / (jnp.sum(jnp.where(row_ok, c, 0.0), axis=0, keepdims=True) + hc_eps) for c in cs
+        ]
 
     def row_norm(cs):
         rs = cs[0]
@@ -149,6 +169,7 @@ def _pre_kernel(x_ref, fnt_ref, sc_ref, bs_ref, col_ref, state_ref, *, hc, d, it
 
     cols = col_norm(cols)
     if iters > 1:
+
         def body(_, cs):
             return tuple(col_norm(row_norm(list(cs))))
 
@@ -172,9 +193,24 @@ def _pre_kernel(x_ref, fnt_ref, sc_ref, bs_ref, col_ref, state_ref, *, hc, d, it
     jax.jit,
     static_argnames=("hc", "hc_iters", "hc_eps", "eps", "block_tokens", "interpret"),
 )
-def glm5_mhc_pre(streams, fn, scale, base, *, hc: int, hc_iters: int, hc_eps: float,
-                 eps: float, block_tokens: int | None = None, interpret: bool | None = None):
+def glm5_mhc_pre(
+    streams,
+    fn,
+    scale,
+    base,
+    *,
+    hc: int,
+    hc_iters: int,
+    hc_eps: float,
+    eps: float,
+    block_tokens: int | None = None,
+    interpret: bool | None = None,
+    prepared=None,
+):
     """streams [T, hc*D], fn [hc*D, (2+hc)*hc], base [(2+hc)*hc], scale [3].
+
+    ``prepared``: optional ``(fn_t, scale_rows, base_rows)`` from ``prepare_fn_t`` /
+    ``prepare_params`` computed once at load time (``fn``/``scale``/``base`` are then unused).
 
     Returns (collapsed [T, D] in streams.dtype, state [T, n_pad] f32); see ``unpack_state``.
     """
@@ -186,16 +222,28 @@ def glm5_mhc_pre(streams, fn, scale, base, *, hc: int, hc_iters: int, hc_eps: fl
     n_pad = _n_pad(hc)
     bt = _block_tokens(t, block_tokens)
 
-    if streams.dtype == jnp.bfloat16 and fn.dtype == jnp.bfloat16:
+    w_dtype = (fn if prepared is None else prepared[0]).dtype
+    if streams.dtype == jnp.bfloat16 and w_dtype == jnp.bfloat16:
         precision, op_dtype = None, jnp.bfloat16  # exact products, f32 MXU accumulation
     else:
         precision, op_dtype = jax.lax.Precision.HIGHEST, jnp.float32
-    fn_t = prepare_fn_t(fn.astype(op_dtype), hc)
-    sc, bs = prepare_params(scale, base, hc)
+    if prepared is None:
+        fn_t = prepare_fn_t(fn.astype(op_dtype), hc)
+        sc, bs = prepare_params(scale, base, hc)
+    else:
+        fn_t, sc, bs = prepared
+        fn_t = fn_t.astype(op_dtype)
 
     kernel = functools.partial(
-        _pre_kernel, hc=hc, d=d, iters=int(hc_iters), hc_eps=float(hc_eps), eps=float(eps),
-        n_tokens=t, bt=bt, precision=precision,
+        _pre_kernel,
+        hc=hc,
+        d=d,
+        iters=int(hc_iters),
+        hc_eps=float(hc_eps),
+        eps=float(eps),
+        n_tokens=t,
+        bt=bt,
+        precision=precision,
     )
     return pl.pallas_call(
         kernel,
@@ -203,8 +251,8 @@ def glm5_mhc_pre(streams, fn, scale, base, *, hc: int, hc_iters: int, hc_eps: fl
         in_specs=[
             pl.BlockSpec((bt, k), lambda i: (i, 0)),
             pl.BlockSpec((n_pad, k), lambda i: (0, 0)),
-            pl.BlockSpec((n_pad, 1), lambda i: (0, 0)),
-            pl.BlockSpec((n_pad, 1), lambda i: (0, 0)),
+            pl.BlockSpec((n_pad, _LANES), lambda i: (0, 0)),
+            pl.BlockSpec((n_pad, _LANES), lambda i: (0, 0)),
         ],
         out_specs=[
             pl.BlockSpec((bt, d), lambda i: (i, 0)),
@@ -234,8 +282,9 @@ def _post_kernel(y_ref, x_ref, st_ref, o_ref, *, hc, d):
 
 
 @functools.partial(jax.jit, static_argnames=("hc", "block_tokens", "interpret"))
-def glm5_mhc_post(y, state, streams, *, hc: int, block_tokens: int | None = None,
-                  interpret: bool | None = None):
+def glm5_mhc_post(
+    y, state, streams, *, hc: int, block_tokens: int | None = None, interpret: bool | None = None
+):
     """y [T, D], state [T, n_pad] (from glm5_mhc_pre), streams [T, hc*D] -> [T, hc*D]."""
     if interpret is None:
         interpret = jax.default_backend() != "tpu"
