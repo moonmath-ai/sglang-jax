@@ -151,6 +151,12 @@ class RecurrentComponent(TreeComponent):
         if cache_len is None:
             # No materialized boundary: nothing to donate; cleanup frees owned slots.
             return 0
+        if self.cache.is_eagle and cache_len > token_ids_len - 1:
+            # EAGLE bigram keys cover one token less than the request holds, so a boundary
+            # at the very end (a prefill chunk ending on it) would land on the page below
+            # it, under a state that already includes that page. Keep the snapshot
+            # (buffer + watermark intact) and donate it once more tokens exist (finish).
+            return 0
 
         keep_idx = self.req_to_token_pool.get_recurrent_ping_pong_keep_idx(req)
         keep_slot = req.recurrent_ping_pong_track_buffer[keep_idx]
