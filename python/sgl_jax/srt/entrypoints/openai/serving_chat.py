@@ -939,6 +939,10 @@ Assistant: {% endif %}"""
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
 
+        if finish_reason_type == "stop" and calls:
+            _reconcile_final_tool_args(parser.detector, calls)
+            finish_reason_type = "tool_calls"
+
         # Yield tool calls
         for call_item in calls:
             # Tool call ID should be generated only once per tool call
@@ -950,23 +954,6 @@ Assistant: {% endif %}"""
                 # Subsequent chunks: null ID and name for argument deltas
                 tool_call_id = None
                 function_name = None
-
-            if finish_reason_type == "stop":
-                # Handle remaining arguments
-                latest_delta_len = 0
-                if isinstance(call_item.parameters, str):
-                    latest_delta_len = len(call_item.parameters)
-
-                expected_call = json.dumps(
-                    parser.detector.prev_tool_call_arr[index].get("arguments", {}),
-                    ensure_ascii=False,
-                )
-                actual_call = parser.detector.streamed_args_for_tool[index]
-                if latest_delta_len > 0:
-                    actual_call = actual_call[:-latest_delta_len]
-                remaining_call = expected_call.replace(actual_call, "", 1)
-                call_item.parameters = remaining_call
-                finish_reason_type = "tool_calls"
 
             tool_call = ToolCall(
                 id=tool_call_id,
@@ -993,3 +980,29 @@ Assistant: {% endif %}"""
                 model=request.model,
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
+
+
+def _reconcile_final_tool_args(detector, calls) -> None:
+    """On the stream's final chunk, make the last tool call's argument deltas end with the
+    fully parsed arguments.
+
+    ``streamed_args_for_tool`` already includes every delta of this chunk (an argument
+    increment and the detector's closing ``}`` can arrive together, e.g. several
+    speculative tokens per step), so the already-sent prefix is the streamed text minus
+    all of this chunk's deltas for that tool -- not just the current item's.
+    """
+    tool_idx = calls[-1].tool_index
+    if not 0 <= tool_idx < min(len(detector.prev_tool_call_arr), len(detector.streamed_args_for_tool)):
+        return
+    mine = [c for c in calls if c.tool_index == tool_idx]
+    pending = "".join(c.parameters for c in mine if isinstance(c.parameters, str))
+    streamed = detector.streamed_args_for_tool[tool_idx]
+    sent = streamed[: len(streamed) - len(pending)]
+    expected = json.dumps(
+        detector.prev_tool_call_arr[tool_idx].get("arguments", {}), ensure_ascii=False
+    )
+    # Fall back to the streamed deltas when the parsed form diverges from what was sent.
+    remaining = expected[len(sent) :] if expected.startswith(sent) else pending
+    for c in mine:
+        c.parameters = ""
+    mine[-1].parameters = remaining
