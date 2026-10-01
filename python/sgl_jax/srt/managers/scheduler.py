@@ -1275,6 +1275,14 @@ class Scheduler(
                 req.set_finish_with_abort(dflash_err)
                 self._add_request_to_queue(req)
                 return
+        elif not self.spec_algorithm.is_none() and (
+            req.return_logprob or req.return_output_logprob_only
+        ):
+            # The speculative workers never fill next_token_logprobs; accepting the request
+            # crashed the scheduler in add_logprob_return_values.
+            req.set_finish_with_abort("Speculative decoding does not support return_logprob yet.")
+            self._add_request_to_queue(req)
+            return
 
         if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
             # By default, only return the logprobs for output tokens
