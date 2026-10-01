@@ -23,6 +23,7 @@ there for the math and its provenance.
 from __future__ import annotations
 
 import logging
+import os
 
 import jax
 import jax.numpy as jnp
@@ -47,6 +48,9 @@ from sgl_jax.srt.models.glm5_moe import (
 from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention, kda_attention_mappings
 
 logger = logging.getLogger(__name__)
+
+# Fused Pallas mHC kernels (kernels/mhc/glm5_mhc.py) instead of the XLA reference chain.
+_MHC_KERNEL = os.environ.get("SGLANG_JAX_MHC_KERNEL", "1") == "1"
 
 
 class Glm5NextHC(nnx.Module):
@@ -84,6 +88,7 @@ class Glm5NextHC(nnx.Module):
         self.hc_iters = hc_iters
         self.hc_eps = hc_eps
         self.eps = rms_eps
+        self.mesh = mesh
         n = (2 + hc_mult) * hc_mult
         sh = NamedSharding(mesh, P(None, None))
         sh1 = NamedSharding(mesh, P(None))
@@ -119,12 +124,51 @@ class Glm5NextHC(nnx.Module):
         collapsed = jnp.einsum("...h,...hd->...d", pre, streams_htd).astype(streams.dtype)
         return post, comb, collapsed
 
+    def _shard_kernel(self, fn, token_args, rep_args, n_out=1):
+        """Run a Pallas mHC kernel per shard. All mHC math is per token, so token-major args keep
+        whatever token-axis sharding the streams carry (e.g. 'data' under DP attention) and are
+        replicated along features (activations are replicated over 'tensor' in attention TP)."""
+        mesh = self.mesh
+        if mesh is None:
+            return fn(*token_args, *rep_args)
+        spec = getattr(jax.typeof(token_args[0]).sharding, "spec", None) or P()
+        tok = P(spec[0] if len(spec) else None, None)
+        token_args = tuple(
+            a if (getattr(jax.typeof(a).sharding, "spec", None) or P(None, None)) == tok
+            else jax.sharding.reshard(a, tok)
+            for a in token_args
+        )
+        rep = tuple(P(*([None] * a.ndim)) for a in rep_args)
+        return jax.shard_map(
+            fn, mesh=mesh, in_specs=(tok,) * len(token_args) + rep,
+            out_specs=tok if n_out == 1 else (tok,) * n_out, check_vma=False,
+        )(*token_args, *rep_args)
+
+    def _kernel_pre(self, streams, fn, scale, base):
+        from sgl_jax.srt.kernels.mhc.glm5_mhc import glm5_mhc_pre
+
+        return glm5_mhc_pre(streams, fn, scale, base, hc=self.hc, hc_iters=self.hc_iters,
+                            hc_eps=self.hc_eps, eps=self.eps)
+
+    def _kernel_post(self, y, state, streams):
+        from sgl_jax.srt.kernels.mhc.glm5_mhc import glm5_mhc_post
+
+        return glm5_mhc_post(y, state, streams, hc=self.hc)
+
     def pre(self, streams: jax.Array):
+        if _MHC_KERNEL and streams.ndim == 2:
+            collapsed, state = self._shard_kernel(
+                self._kernel_pre, (streams,),
+                (self.fn.value, self.scale.value, self.base.value), n_out=2,
+            )
+            return collapsed, state  # state: [T, n_pad] f32 packed gates (glm5_mhc.unpack_state)
         post, comb, collapsed = self._mix(streams)
         return collapsed, (post, comb)
 
     def post(self, y: jax.Array, state, streams: jax.Array):
         """y: [..., D] sublayer output. Returns the new [..., hc*D] streams."""
+        if not isinstance(state, tuple):  # packed state from the fused kernel path
+            return self._shard_kernel(self._kernel_post, (y, state, streams), ())
         post, comb = state
         hc = self.hc
         lead = streams.shape[:-1]
