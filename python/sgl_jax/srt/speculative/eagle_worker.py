@@ -3,7 +3,6 @@ import logging
 import time
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -121,8 +120,6 @@ class EAGLEWorker(BaseSpecWorker):
                         dp_size=dp_size,
                         per_dp_bs_size=per_dp_bs,
                     )
-                    # Runtime spec prefill never carries CoW sources (radix cache is off).
-                    model_worker_batch.recurrent_cow_src_indices = None
                     self.forward_batch_speculative_generation(model_worker_batch)
                     jax.block_until_ready(target.model_runner.memory_pools)
                     continue

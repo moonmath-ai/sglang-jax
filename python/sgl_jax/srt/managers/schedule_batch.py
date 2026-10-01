@@ -933,6 +933,25 @@ def _build_recurrent_track_entries(
     )
 
 
+def record_spec_recurrent_track(
+    req: Req, old_state_len: int, accepted: int, *, interval: int, pool
+) -> None:
+    """Host half of the speculative-round track snapshot (see chain_fused_round).
+
+    The round grew the recurrent state from ``old_state_len`` to ``old_state_len + accepted``
+    tokens and snapshotted the first track boundary in that range into the request's next
+    ping-pong slot. Call after ``check_finished``: the boundary is recorded only if its
+    tokens survived finish truncation (else the slot is simply never published).
+    """
+    boundary = (old_state_len // interval + 1) * interval
+    total = len(req.origin_input_ids) + len(req.output_ids)
+    if boundary <= old_state_len + accepted and boundary <= total - 1:
+        req.recurrent_last_track_seqlen = boundary
+        req.recurrent_next_track_idx = pool.get_recurrent_ping_pong_other_idx(
+            req.recurrent_next_track_idx
+        )
+
+
 def swa_eviction_interval(sliding_window_size: int, page_size: int) -> int:
     """Return the page-aligned decode interval between SWA evictions."""
     multiplier = float(os.environ.get("SGL_JAX_SWA_EVICTION_INTERVAL_MULTIPLIER", "1.0"))
@@ -1834,6 +1853,21 @@ class ScheduleBatch:
             per_rank_spec = self._split_spec_info_per_rank(flat_spec, real_bs_per_dp)
             for r, s in enumerate(per_rank_spec):
                 self.reqs_info[r].spec_info = s
+            if self.tree_cache is not None and self.tree_cache.recurrent_extra_buffer_active():
+                # The round decides on device whether a request's accepted prefix crosses a
+                # track boundary (it then snapshots into this slot); the host records the
+                # boundary and flips the slot when it processes the round's accept lengths
+                # (record_spec_recurrent_track).
+                for info in self.reqs_info:
+                    if info.reqs:
+                        info.recurrent_track_indices = np.asarray(
+                            [
+                                r.recurrent_ping_pong_track_buffer[r.recurrent_next_track_idx]
+                                for r in info.reqs
+                            ],
+                            dtype=np.int32,
+                        )
+                        info.recurrent_track_mask = np.ones(len(info.reqs), dtype=np.int32)
             return
 
         # Process each DP rank
@@ -3335,6 +3369,20 @@ class ScheduleBatch:
             for info in self.reqs_info:
                 info.recurrent_track_indices = None
                 info.recurrent_track_mask = None
+        if (
+            self.spec_algorithm is not None
+            and not self.spec_algorithm.is_none()
+            and self.forward_mode.is_extend()
+            and self.tree_cache is not None
+            and self.tree_cache.recurrent_extra_buffer_active()
+        ):
+            # Spec prefill runs one program shape per bucket (the precompiled one): always
+            # carry the CoW / track arrays (zeros = skip) instead of None on a cache miss
+            # or off a track boundary.
+            zeros = lambda a: np.zeros(total_bs, dtype=np.int32) if a is None else a  # noqa: E731
+            recurrent_cow_src_indices_cpu = zeros(recurrent_cow_src_indices_cpu)
+            recurrent_track_indices_cpu = zeros(recurrent_track_indices_cpu)
+            recurrent_track_mask_cpu = zeros(recurrent_track_mask_cpu)
         # has_initial_state[i] = True iff slot i already holds
         # prior KV/recurrent state (extend with prefix, or any decode slot).
         has_initial_state_cpu = np.ones(total_bs, dtype=np.bool_)

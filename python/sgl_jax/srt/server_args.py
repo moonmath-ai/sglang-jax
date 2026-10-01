@@ -542,11 +542,20 @@ class ServerArgs:
                         self.chunked_prefill_size,
                         self.recurrent_track_interval,
                     )
-            if self.speculative_algorithm is not None:
+            # Speculative rounds snapshot track boundaries only in the one-JIT chain round
+            # (chain_fused_round.py): NEXTN, topk=1 chains, MLA-family target at dp=1.
+            if self.speculative_algorithm is not None and not (
+                self.speculative_algorithm == "NEXTN"
+                and self.speculative_eagle_topk == 1
+                and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
+                and self.attention_backend in ("dsa_sparse", "mla")
+                and self.dp_size == 1
+            ):
                 raise ValueError(
-                    "--enable-recurrent-extra-buffer does not support speculative "
-                    f"decoding yet; got --speculative-algorithm={self.speculative_algorithm}. "
-                    "Disable one of them."
+                    "--enable-recurrent-extra-buffer supports speculative decoding only for "
+                    "NEXTN with --speculative-eagle-topk=1, --speculative-num-draft-tokens == "
+                    "--speculative-num-steps + 1, a dsa_sparse/mla attention backend and dp=1; "
+                    f"got --speculative-algorithm={self.speculative_algorithm}."
                 )
             if self.enable_mixed_chunk:
                 raise ValueError(

@@ -207,7 +207,11 @@ class RecurrentStatePool:
         recurrent_shape = (self.total_slots, self.num_heads, self.head_dim, self.head_dim)
         if self.conv_tiled:
             conv_shape = (
-                self.total_slots, self.conv_kernel_size - 1, 3, self.num_heads, self.head_dim
+                self.total_slots,
+                self.conv_kernel_size - 1,
+                3,
+                self.num_heads,
+                self.head_dim,
             )
         else:
             conv_shape = (self.total_slots, self.proj_size, self.conv_kernel_size - 1)
@@ -497,7 +501,14 @@ class RecurrentStatePool:
 
 @partial(
     jax.jit,
-    static_argnames=("mesh", "data_axis", "recurrent_axis", "conv_axis", "conv_tiled", "lazy_commit"),
+    static_argnames=(
+        "mesh",
+        "data_axis",
+        "recurrent_axis",
+        "conv_axis",
+        "conv_tiled",
+        "lazy_commit",
+    ),
     donate_argnums=(0, 1),
 )
 def _commit_speculative_state(
@@ -512,11 +523,18 @@ def _commit_speculative_state(
     conv_axis,
     conv_tiled=False,
     lazy_commit=False,
+    track_indices=None,
+    track_steps=None,
 ):
     """Per layer and batch row b: ``ssm[idx[b]] = spec_ssm[b, a[b]-1]`` (same for conv).
 
     The verify scratch is indexed by batch row (see ``KDAAttnBackend._forward_target_verify``).
+    ``track_indices`` / ``track_steps`` (extra-buffer radix cache): a row with
+    ``track_steps[b] >= 0`` also snapshots ``spec_ssm[b, track_steps[b]]`` into its track slot
+    ``track_indices[b]`` (the state at the track boundary its accepted prefix crossed).
     """
+    track = track_indices is not None
+    assert not (track and lazy_commit), "track snapshots need the eager commit"
 
     if lazy_commit:
         # Slot-indexed scratch: record the accepted step; no state is copied.
@@ -525,7 +543,10 @@ def _commit_speculative_state(
             return steps.at[dst].set(jnp.where(dst == 0, -1, acc - 1).astype(steps.dtype))
 
         record = jax.shard_map(
-            _record, mesh=mesh, in_specs=(P(data_axis),) * 3, out_specs=P(data_axis),
+            _record,
+            mesh=mesh,
+            in_specs=(P(data_axis),) * 3,
+            out_specs=P(data_axis),
             check_vma=False,
         )
         new_conv = [
@@ -534,38 +555,47 @@ def _commit_speculative_state(
         ]
         return list(recurrent_buffers), new_conv
 
-    def _select(buf, spec, idx, acc):
+    def _select(buf, spec, idx, acc, *track_rows):
         buf = jax.lax.optimization_barrier(buf)  # donated-buffer aliasing guard, see copy_slots
         steps = spec.shape[1]
+        rows = jnp.arange(idx.shape[0])
         step = jnp.clip(acc - 1, 0, steps - 1)
-        val = spec[jnp.arange(idx.shape[0]), step]
         # Rows to leave alone (padding slot 0, accept <= 0) write their (finite) verify state
         # into the reserved dummy slot 0 instead of re-writing their own row: no gather of
         # buf[idx] and no select.
         dst = jnp.where((idx == 0) | (acc <= 0), 0, idx)
-        return jax.lax.optimization_barrier(buf.at[dst].set(val))
+        if track_rows:  # one scatter for running + track rows; idle track rows hit slot 0
+            t_idx, t_step = track_rows
+            rows = jnp.concatenate([rows, rows])
+            step = jnp.concatenate([step, jnp.clip(t_step, 0, steps - 1)])
+            dst = jnp.concatenate([dst, jnp.where(t_step >= 0, t_idx, 0)])
+        return jax.lax.optimization_barrier(buf.at[dst].set(spec[rows, step]))
 
+    row_args = (recurrent_indices, accept_lens) + ((track_indices, track_steps) if track else ())
+    n_row_args = len(row_args)
     commit_ssm = jax.shard_map(
         _select,
         mesh=mesh,
         in_specs=(
             P(data_axis, recurrent_axis, None, None),
             P(data_axis, None, recurrent_axis, None, None),
-            P(data_axis),
-            P(data_axis),
+            *(P(data_axis),) * n_row_args,
         ),
         out_specs=P(data_axis, recurrent_axis, None, None),
         check_vma=False,
     )
-    conv_spec = P(data_axis, None, None, conv_axis, None) if conv_tiled else P(data_axis, conv_axis, None)
+    conv_spec = (
+        P(data_axis, None, None, conv_axis, None) if conv_tiled else P(data_axis, conv_axis, None)
+    )
     spec_conv_spec = (
-        P(data_axis, None, None, None, conv_axis, None) if conv_tiled
+        P(data_axis, None, None, None, conv_axis, None)
+        if conv_tiled
         else P(data_axis, None, conv_axis, None)
     )
     commit_conv = jax.shard_map(
         _select,
         mesh=mesh,
-        in_specs=(conv_spec, spec_conv_spec, P(data_axis), P(data_axis)),
+        in_specs=(conv_spec, spec_conv_spec, *(P(data_axis),) * n_row_args),
         out_specs=conv_spec,
         check_vma=False,
     )
@@ -573,6 +603,6 @@ def _commit_speculative_state(
     new_conv = []
     for rec, inner in zip(recurrent_buffers, conv_buffers):
         conv, spec_conv, spec_ssm = inner
-        new_recurrent.append(commit_ssm(rec, spec_ssm, recurrent_indices, accept_lens))
-        new_conv.append([commit_conv(conv, spec_conv, recurrent_indices, accept_lens), spec_conv, spec_ssm])
+        new_recurrent.append(commit_ssm(rec, spec_ssm, *row_args))
+        new_conv.append([commit_conv(conv, spec_conv, *row_args), spec_conv, spec_ssm])
     return new_recurrent, new_conv

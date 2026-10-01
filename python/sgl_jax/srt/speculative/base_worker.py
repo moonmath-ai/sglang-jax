@@ -120,6 +120,15 @@ class BaseSpecWorker:
 
             if can_use_chain_fused_round(self):
                 self._chain_fused_round = ChainFusedRound(self)
+        if (
+            server_args.enable_recurrent_extra_buffer
+            and not server_args.disable_radix_cache
+            and self._chain_fused_round is None
+        ):
+            raise ValueError(
+                "--enable-recurrent-extra-buffer with speculative decoding needs the chain "
+                "fused round (track snapshots are taken there); it is unavailable here."
+            )
 
         (
             self.precompile_token_paddings,
@@ -300,7 +309,10 @@ class BaseSpecWorker:
             self.draft_worker.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
             )
-            if self._chain_fused_round is not None and not self.server_args.disable_overlap_schedule:
+            if (
+                self._chain_fused_round is not None
+                and not self.server_args.disable_overlap_schedule
+            ):
                 # Overlap schedule: the next decode round reads its entry state from the relay
                 # (and the scheduler merges this batch before reading its result).
                 self.init_spec_relay_buffers()
@@ -422,7 +434,10 @@ class BaseSpecWorker:
         t3 = time.perf_counter()
         logging.getLogger(__name__).info(
             "spec round bs=%d: draft=%.1fms verify=%.1fms draft_extend=%.1fms",
-            len(model_worker_batch.seq_lens), (t1 - t0) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3,
+            len(model_worker_batch.seq_lens),
+            (t1 - t0) * 1e3,
+            (t2 - t1) * 1e3,
+            (t3 - t2) * 1e3,
         )
         launch_done = getattr(model_worker_batch, "launch_done", None)
         if launch_done is not None:

@@ -164,7 +164,7 @@ def _fused_round(
     tgt_def, tgt_state_def, tgt_leaves, tgt_pools,
     dr_def, dr_state_def, dr_leaves, dr_pools,
     elm, int_blob, f32_blob, hidden, base_key, relay,
-    *, layout, steps, T, bs, threshold_single, threshold_acc, mesh, use_relay,
+    *, layout, steps, T, bs, threshold_single, threshold_acc, mesh, use_relay, track_interval,
     tgt_backend_def, dr_backend_def,
 ):
     rep = NamedSharding(mesh, P())
@@ -309,6 +309,20 @@ def _fused_round(
     if "recurrent_state_pool" in tgt_pools._pools:
         rsp = tgt_pools.recurrent_state_pool
         data = NamedSharding(mesh, P(rsp.data_partition_axis))
+        track = {}
+        if track_interval:
+            # Extra-buffer radix cache: snapshot the state at the first track boundary the
+            # accepted prefix reaches (state length L0 -> L0 + a; at most one boundary per
+            # round since the interval >> T) into the request's next ping-pong track slot.
+            track_indices = I("track_indices")
+            boundary = (verified_seq_lens // track_interval + 1) * track_interval
+            crossed = valid & (track_indices != 0) & (boundary <= verified_seq_lens + accept_length)
+            track = dict(
+                track_indices=jax.sharding.reshard(track_indices, data),
+                track_steps=jax.sharding.reshard(
+                    jnp.where(crossed, boundary - verified_seq_lens - 1, -1).astype(jnp.int32), data
+                ),
+            )
         new_rec, new_conv = _commit_speculative_state(
             rsp.recurrent_buffers, rsp.conv_buffers,
             jax.sharding.reshard(recurrent_indices, data),
@@ -316,7 +330,7 @@ def _fused_round(
             mesh=mesh, data_axis=rsp.data_partition_axis,
             recurrent_axis=rsp.recurrent_partition_axis, conv_axis=rsp.conv_partition_axis,
             conv_tiled=getattr(rsp, "conv_tiled", False),
-            lazy_commit=getattr(rsp, "lazy_commit", False))
+            lazy_commit=getattr(rsp, "lazy_commit", False), **track)
         tgt_updates = dict(tgt_updates)
         tgt_updates["recurrent_state_pool"] = (new_rec, new_conv)
 
@@ -379,6 +393,13 @@ class ChainFusedRound:
         self.mesh = spec_worker.mesh
         self._key = jax.random.PRNGKey(spec_worker.server_args.random_seed or 0)
         self._round_id = 0
+        sa = spec_worker.server_args
+        # Track-boundary snapshots for the extra-buffer radix cache (0: off).
+        self.track_interval = (
+            int(sa.recurrent_track_interval)
+            if sa.enable_recurrent_extra_buffer and not sa.disable_radix_cache
+            else 0
+        )
         tgt_backend = spec_worker.target_worker.model_runner.attn_backend
         compiler_options = dict(getattr(tgt_backend, "compiler_options", None) or {})
         if jax.default_backend() == "tpu" and get_bool_env_var(
@@ -399,7 +420,8 @@ class ChainFusedRound:
             partial(_fused_round, tgt_backend_def=tgt_def, dr_backend_def=dr_def),
             donate_argnames=("tgt_pools", "dr_pools"),
             static_argnames=("tgt_state_def", "dr_state_def", "layout", "steps", "T", "bs",
-                             "threshold_single", "threshold_acc", "mesh", "use_relay"),
+                             "threshold_single", "threshold_acc", "mesh", "use_relay",
+                             "track_interval"),
             compiler_options=compiler_options,
         )
 
@@ -470,6 +492,13 @@ class ChainFusedRound:
             ("use_top_p", np.asarray([int(use_top_p)], np.int32)),
             ("round_id", np.asarray([self._round_id], np.int32)),
         ]
+        if self.track_interval:
+            track_indices = getattr(mwb, "recurrent_track_indices", None)
+            if track_indices is None:
+                track_indices = np.zeros(bs, np.int32)
+            named_int.append(
+                ("track_indices", _pad_rows(np.asarray(track_indices, np.int32), bs, 0))
+            )
         if overlap:
             req_pool = _pad_rows(np.asarray(mwb.req_pool_indices, np.int32).reshape(-1), bs, 0)
             named_int.append(("future_indices", np.where(valid, req_pool, 0).astype(np.int32)))
@@ -502,7 +531,7 @@ class ChainFusedRound:
                 threshold_single=float(
                     global_server_args_dict["speculative_accept_threshold_single"]),
                 threshold_acc=float(global_server_args_dict["speculative_accept_threshold_acc"]),
-                mesh=self.mesh, use_relay=overlap,
+                mesh=self.mesh, use_relay=overlap, track_interval=self.track_interval,
             )
         tmr.memory_pools.replace_all(tgt_updates)
         dmr.memory_pools.replace_all(dr_updates)

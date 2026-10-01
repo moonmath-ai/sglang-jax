@@ -11,7 +11,12 @@ import numpy as np
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
-from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sgl_jax.srt.managers.schedule_batch import (
+    BaseFinishReason,
+    Req,
+    ScheduleBatch,
+    record_spec_recurrent_track,
+)
 from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.speculative.overlap_utils import (
@@ -483,6 +488,14 @@ class SchedulerOutputProcessorMixin:
         # every visited req (including retracted) so the counter stays
         # aligned with the selector.
         req_idx = 0
+        track_interval = (
+            self.tree_cache.recurrent_track_interval
+            if is_spec_decode
+            and self.spec_algorithm.is_eagle()
+            and self.tree_cache is not None
+            and self.tree_cache.recurrent_extra_buffer_active()
+            else 0
+        )
 
         for dp_rank in range(batch.dp_size):
             info = batch.reqs_info[dp_rank]
@@ -513,10 +526,20 @@ class SchedulerOutputProcessorMixin:
                 if not is_spec_decode:
                     req.output_ids.append(next_token_id)
                 elif self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family():
+                    # Recurrent state length before this round (the last token is pending).
+                    old_state_len = len(req.origin_input_ids) + len(req.output_ids) - 1
                     req.output_ids.extend([int(t) for t in next_token_id])
                     new_accepted_len = len(next_token_id)
 
                 req.check_finished(new_accepted_len)
+                if track_interval:
+                    record_spec_recurrent_track(
+                        req,
+                        old_state_len,
+                        new_accepted_len,
+                        interval=track_interval,
+                        pool=self.req_to_token_pool,
+                    )
 
                 if req.finished():
                     self.maybe_collect_routed_experts(req)

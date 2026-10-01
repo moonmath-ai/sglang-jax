@@ -11,7 +11,12 @@ from sgl_jax.srt.lora.context_manager import LoraBatchContext
 def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
     """Clone matched tree slots before recurrent reads, when requested."""
     src = getattr(forward_batch, "recurrent_cow_src_indices", None)
-    if src is None or forward_batch.recurrent_indices is None:
+    if (
+        src is None
+        or forward_batch.recurrent_indices is None
+        # A draft model without recurrent layers shares the target's batch metadata.
+        or "recurrent_state_pool" not in memory_pools._pools
+    ):
         return memory_pools
     rsp = memory_pools.recurrent_state_pool
     new_recurrent, new_conv = rsp.copy_slots(src, forward_batch.recurrent_indices)
