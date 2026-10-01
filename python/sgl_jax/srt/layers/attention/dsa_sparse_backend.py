@@ -84,7 +84,8 @@ _INDEXER_KERNEL_PREFILL = os.environ.get("DSA_INDEXER_KERNEL_PREFILL", "0") == "
 # multi-query pass per request over the union of its chain tokens' hit pages instead of
 # one virtual sequence per token (which re-reads the request's pages per token).
 _CHAIN_REQUEST_MLA = os.environ.get("DSA_CHAIN_REQUEST_MLA", "1") == "1"
-
+# Speculative-chain sparse MLA KV block (pages); see _run_sparse_chain.
+_CHAIN_KV_PAGES_PER_BLOCK = 16
 
 # bkv block of 64 pages (4K tokens @ page 64) benched fastest across
 # B=8..64, ctx 8K..128K on v7x/v6e.
@@ -335,7 +336,15 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         mode = forward_batch.forward_mode
         is_spec_chain = mode.is_target_verify() or mode.is_draft_extend()
         is_decode = mode.is_decode() or is_spec_chain
-        if is_spec_chain:
+        # The request-level chain kernel (_run_sparse_chain) writes the chain's KV itself (one
+        # causal Tq-query pass per request); only the per-token virtual-sequence paths need it.
+        chain_kernel = (
+            is_spec_chain
+            and q_idx is not None
+            and (is_full or dsa_topk_pages_in is not None)
+            and self._uses_chain_kernel(md)
+        )
+        if is_spec_chain and not chain_kernel:
             kv_cache = self._prewrite_chain_kv(new_kv_c, new_k_pe, kv_cache, dpa, md)
         if is_full and q_idx is None:
             o, kv_cache = self._run_dense(
@@ -568,7 +577,6 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             if (
                 compute_topk
                 and req_
-                and _INDEXER_LIVE
                 and cache3d.dtype == jnp.bfloat16
                 and idx_dim % 128 == 0
                 and page_size % 2 == 0
@@ -591,7 +599,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 )
                 topk_pages = (
                     compute_topk_pages(
-                        topk, page_size=self.page_size, pages_per_seq=pages_per_seq,
+                        topk,
+                        page_size=self.page_size,
+                        pages_per_seq=pages_per_seq,
                         k_pages_max=511,
                     )
                     if compute_pages
@@ -848,6 +858,14 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             check_vma=False,
         )(kvc, kpe, cache, md.seq_lens, md.page_indices, md.cu_kv_lens)
 
+    @staticmethod
+    def _uses_chain_kernel(md) -> bool:
+        return (
+            _CHAIN_REQUEST_MLA
+            and getattr(md, "spec_req_seq_lens", None) is not None
+            and _PAGE_TOPK_BUDGET == 0
+        )
+
     def _run_sparse(
         self,
         ql,
@@ -863,12 +881,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         page_share_group: int = 1,
         group_queries: bool = False,
     ):
-        if (
-            _CHAIN_REQUEST_MLA
-            and topk_pages is not None
-            and getattr(md, "spec_req_seq_lens", None) is not None
-            and _PAGE_TOPK_BUDGET == 0
-        ):
+        if topk_pages is not None and self._uses_chain_kernel(md):
             return self._run_sparse_chain(ql, qpe, kvc, kpe, cache, topk_pages, sm_scale, dpa, md)
         has_pages = topk_pages is not None
         if not has_pages:
@@ -947,7 +960,15 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         def _run(ql_, qpe_, kvc_, kpe_, cache_, tpages_, req_seq_, req_pi_, req_dist_):
             page_size = cache_.shape[1] * cache_.shape[2]
             return sparse_mla_chain_request_level(
-                ql_, qpe_, kvc_, kpe_, cache_, tpages_, req_seq_, req_pi_, req_dist_,
+                ql_,
+                qpe_,
+                kvc_,
+                kpe_,
+                cache_,
+                tpages_,
+                req_seq_,
+                req_pi_,
+                req_dist_,
                 sm_scale=float(sm_scale),
                 page_size=page_size,
                 queries_per_seq=Tq,
@@ -955,6 +976,12 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 k_pages_max=512,
                 mask_pages=self._mask_pages(req_pi_.shape[0] // req_seq_.shape[0]),
                 vmem_limit_bytes=self.vmem_limit_bytes,
+                # One q block per request (its Tq chain tokens) and 16-page KV blocks: best at
+                # bs 16/32/64 (2026-10-01 sweep). Explicit, because the tuned-table key
+                # (mixed, mnt=B*Tq) collides with prefill buckets (e.g. mnt 256 at bs 64 picked
+                # the prefill (4, 128) entry: 2.6 ms/layer instead of ~0.9).
+                num_kv_pages_per_block=_CHAIN_KV_PAGES_PER_BLOCK,
+                num_queries_per_block=Tq,
             )
 
         return jax.shard_map(
@@ -973,8 +1000,15 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             out_specs=(P(dpa, "tensor", None), P(dpa, None, None, None)),
             check_vma=False,
         )(
-            ql, qpe, kvc, kpe, cache, topk_pages,
-            md.spec_req_seq_lens, md.spec_req_page_indices, md.spec_req_distribution,
+            ql,
+            qpe,
+            kvc,
+            kpe,
+            cache,
+            topk_pages,
+            md.spec_req_seq_lens,
+            md.spec_req_page_indices,
+            md.spec_req_distribution,
         )
 
     def _maybe_index_prefill_pages(
@@ -1806,14 +1840,17 @@ def _kpool_write(
         return blk + 1 + r // E, row // pack, row % pack
 
     dt = blocks.dtype
-    blocks = blocks.at[at_raw(2 * off, base)].set(keys.astype(dt))
-    blocks = blocks.at[at_raw(2 * off + 1, base)].set(gates.astype(dt))
+    # Key / gate of a token are raw rows 2t, 2t+1 (same block): one scatter writes both.
+    pair = jnp.arange(2)[None, :]
+    blocks = blocks.at[at_raw(2 * off[:, None] + pair, base[:, None])].set(
+        jnp.stack([keys, gates], axis=1).astype(dt)
+    )
 
     closes = valid & ((abs_pos + 1) % kpool == 0)
     first = jnp.where(closes, off - (kpool - 1), 0)  # pools never straddle a page
     toks = first[:, None] + jnp.arange(kpool)[None, :]  # [T, kpool]
-    k_raw = blocks[at_raw(2 * toks, base[:, None])].astype(jnp.float32)  # [T, kpool, D]
-    g_raw = blocks[at_raw(2 * toks + 1, base[:, None])].astype(jnp.float32)
+    kg = blocks[at_raw(2 * toks[..., None] + pair[None], base[:, None, None])].astype(jnp.float32)
+    k_raw, g_raw = kg[:, :, 0], kg[:, :, 1]  # [T, kpool, D] each, one gather
     pooled = (jax.nn.softmax(g_raw, axis=1) * k_raw).sum(axis=1)
     prow = jnp.where(closes, off // kpool, 0)
     pblk = jnp.where(closes, base, 0)
