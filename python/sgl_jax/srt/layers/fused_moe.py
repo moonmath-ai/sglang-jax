@@ -1,5 +1,7 @@
 """Fused Expert-Parallel MoE layer using Pallas kernel."""
 
+import os
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
@@ -556,6 +558,12 @@ class FusedEPMoE(nnx.Module):
         return output
 
 
+# Token count at/above which FusedEPMoEV2 runs the grouped-matmul path (moe_gmm_prefill.py).
+_GMM_MIN_TOKENS = 1024
+# SGL_JAX_MOE_GMM_PREFILL=0 keeps prefill-sized batches on the fused kernel.
+_GMM_PREFILL = os.environ.get("SGL_JAX_MOE_GMM_PREFILL", "1") == "1"
+
+
 class FusedEPMoEV2(FusedEPMoE):
     """V2 fused EP-MoE layer using the Strix-style double-buffer kernel.
 
@@ -580,6 +588,33 @@ class FusedEPMoEV2(FusedEPMoE):
         )
 
         assert hidden_states.ndim == 2
+
+        if (
+            _GMM_PREFILL
+            and hidden_states.shape[0] >= _GMM_MIN_TOKENS
+            and self.w1_scale is not None
+            and getattr(self, "quant_block_k", None) is not None
+        ):
+            # Large (prefill) batches: grouped-matmul EP path on the same weights (the fused
+            # kernel is tuned for decode-sized batches; ~3.4x slower at 4096 tokens).
+            from sgl_jax.srt.layers.moe_gmm_prefill import gmm_prefill_moe
+
+            val = lambda p: None if p is None else p.value
+            output = gmm_prefill_moe(
+                self.mesh, hidden_states, topk_weights, topk_ids,
+                self.w1.value, self.w3.value, self.w2.value,
+                self.w1_scale.value, self.w3_scale.value, self.w2_scale.value,
+                val(self.w1_shared), val(self.w3_shared), val(self.w2_shared),
+                val(self.w1_shared_scale), val(self.w3_shared_scale), val(self.w2_shared_scale),
+                top_k=self.num_experts_per_tok,
+                swiglu_limit=swiglu_limit,
+                shared_swiglu_limit=shared_swiglu_limit,
+                act_quant=self.activation_quantized_dtype is not None
+                and self.enable_act_quant_cfg is not False,
+            )
+            return jax.sharding.reshard(
+                output, out_sharding or jax.sharding.NamedSharding(self.mesh, P("data", None))
+            )
 
         w1_scale = self.w1_scale.value if self.w1_scale is not None else None
         w3_scale = self.w3_scale.value if self.w3_scale is not None else None
