@@ -11,6 +11,8 @@ class KimiLinearConfig(PretrainedConfig):
     model_type = "kimi_linear"
     keys_to_ignore_at_inference = ["past_key_values"]
 
+    use_kda = True  # linear layers run KDAAttnBackend (see model_runner_kv_cache_mixin)
+
     def __init__(
         self,
         model_type="kimi_linear",

@@ -244,6 +244,7 @@ def _build_hybrid_pools(
     enable_recurrent_extra_buffer: bool = False,
     ping_pong_slots: int = 2,
     spec_num_draft_tokens: int = 0,
+    radix_cache_disabled: bool = False,
 ) -> tuple:
     """Build RecurrentStatePool + HybridReqToTokenPool + MemoryPools.
 
@@ -262,6 +263,11 @@ def _build_hybrid_pools(
     ), f"recurrent state_size ({state_size}) must be divisible by dp_size ({dp_size})."
 
     state_params = _linear_state_params_from_config(cfg)
+    # KDA models (KDAAttnBackend, equal q/k/v conv widths): lane-dense conv state layout.
+    conv_tiled = bool(getattr(cfg, "use_kda", False)) and (
+        state_params.num_k_heads in (None, state_params.num_heads)
+        and state_params.head_k_dim in (None, state_params.head_dim)
+    )
     rsp = RecurrentStatePool(
         linear_recurrent_layer_ids=state_params.layers,
         size=state_size,
@@ -275,6 +281,11 @@ def _build_hybrid_pools(
         num_k_heads=state_params.num_k_heads,
         head_k_dim=state_params.head_k_dim,
         spec_num_draft_tokens=spec_num_draft_tokens,
+        # KDA-backend models: lane-dense conv state layout (see RecurrentStatePool).
+        conv_tiled=conv_tiled,
+        # Slot-indexed verify scratch, commit = record the accepted step (no state copy).
+        # Needs the radix cache off: slot copies / tracks would read a stale pool row.
+        lazy_commit=conv_tiled and radix_cache_disabled,
     )
     hybrid_pool = HybridReqToTokenPool(
         size=max_num_reqs,
@@ -877,6 +888,7 @@ class ModelRunnerKVCacheMixin:
                     and not self.is_draft_worker
                     else 0
                 ),
+                radix_cache_disabled=bool(self.server_args.disable_radix_cache),
             )
         else:
             self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)

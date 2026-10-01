@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
@@ -296,6 +297,60 @@ class KimiDeltaAttention(nnx.Module):
             dt_bias=self.dt_bias,
         )
         self.attn.kda_gate_lower_bound = linear_config.get("gate_lower_bound")
+        # Tiled [W, 3, H, D] copy of the q/k/v conv taps for the conv-fused verify kernel,
+        # written at load (prepare_weight_loading; avoids a per-call stack/transpose).
+        conv_w_tiled = None
+        if self.num_k_heads == self.num_v_heads and self.k_head_dim == self.v_head_dim:
+            sh = NamedSharding(mesh, P(None, None, "tensor", None)) if mesh is not None else None
+            conv_w_tiled = nnx.Param(
+                jnp.zeros(
+                    (self.conv_size, 3, self.num_k_heads, self.k_head_dim),
+                    dtype=dtype,
+                    out_sharding=sh,
+                )
+            )
+        self.attn.conv_w_tiled = nnx.data(conv_w_tiled)
+
+    def prepare_weight_loading(self, loader, mappings, prefix):
+        # The conv-fused verify kernel reads the q/k/v conv taps as one tiled [W, 3, H, D]
+        # copy: load the three conv weights through one recipe that also writes that copy.
+        if getattr(self.attn, "conv_w_tiled", None) is None:
+            return mappings
+        targets = tuple(f"{prefix}.attn.{name}_conv1d.weight" for name in "qkv")
+        by_target = {
+            spec.target_path: source
+            for source, spec in mappings.items()
+            if isinstance(spec.target_path, str)
+        }
+        if not all(target in by_target for target in targets):
+            return mappings
+        sources = tuple(by_target[target] for target in targets)
+        mappings = {key: spec for key, spec in mappings.items() if key not in sources}
+        mappings[sources[0]] = WeightSpec(
+            [*targets, f"{prefix}.attn.conv_w_tiled"],
+            sources=sources,
+            recipe=self._prepare_conv_weights,
+        )
+        return mappings
+
+    def _prepare_conv_weights(self, inputs):
+        """(q, k, v conv weights as stored) -> the three [H*D, W] weights and the tiled copy."""
+        H, D, W = self.num_k_heads, self.k_head_dim, self.conv_size
+        dtype = self.q_conv1d.weight.value.dtype
+        convs = [np.asarray(x).reshape(H * D, W).astype(dtype) for x in inputs]
+        tiled = np.ascontiguousarray(
+            np.transpose(np.stack(convs).reshape(3, H, D, W), (3, 0, 1, 2))
+        ).astype(self.attn.conv_w_tiled.value.dtype)
+
+        def place(w, axes):
+            return jax.make_array_from_callback(
+                w.shape, NamedSharding(self.mesh, P(*axes)), lambda index, w=w: w[index]
+            )
+
+        return (
+            *(place(w, ("tensor", None)) for w in convs),
+            place(tiled, (None, None, "tensor", None)),
+        )
 
     def __call__(
         self,

@@ -314,7 +314,9 @@ def _fused_round(
             jax.sharding.reshard(recurrent_indices, data),
             jax.sharding.reshard(accept_length, data),
             mesh=mesh, data_axis=rsp.data_partition_axis,
-            recurrent_axis=rsp.recurrent_partition_axis, conv_axis=rsp.conv_partition_axis)
+            recurrent_axis=rsp.recurrent_partition_axis, conv_axis=rsp.conv_partition_axis,
+            conv_tiled=getattr(rsp, "conv_tiled", False),
+            lazy_commit=getattr(rsp, "lazy_commit", False))
         tgt_updates = dict(tgt_updates)
         tgt_updates["recurrent_state_pool"] = (new_rec, new_conv)
 
