@@ -54,3 +54,22 @@ def test_exact_and_small_batches_unchanged(n_batch):
     bm = tuned.batch_block_size
     assert bm == n_batch or bm % 8 == 0
     assert bm <= n_batch
+
+
+@pytest.mark.parametrize("n_batch", [1, 16, 64, 256])
+@pytest.mark.parametrize("n_out", [1536, 3072, 2048])
+def test_out_block_divides_n(n_batch, n_out):
+    # A power-of-two out block that does not divide N (1024 for N=1536) makes the
+    # kernel wrapper pad the weight to a block multiple on every call.
+    with mock.patch.object(blockwise_utils, "_get_current_tpu_version", return_value=7):
+        tuned = blockwise_utils.get_safe_blockwise_tuned_value(
+            n_batch=n_batch,
+            n_out=n_out,
+            n_in=6144,
+            x_q_dtype=jnp.bfloat16,
+            w_q_dtype=jnp.float8_e4m3fn,
+            block_size_in=128,
+        )
+    if tuned is None:
+        pytest.skip("blockwise tuning API unavailable")
+    assert n_out % tuned.out_block_size == 0, (n_out, tuned.out_block_size)

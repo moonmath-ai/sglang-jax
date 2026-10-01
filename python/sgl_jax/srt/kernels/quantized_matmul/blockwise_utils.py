@@ -400,6 +400,10 @@ def get_safe_blockwise_tuned_value(
         compute_tile_n,
         _floor_multiple(int(n_out), compute_tile_n),
     )
+    # Prefer a block that divides N: otherwise the kernel wrapper pads the (fp8) weight to a
+    # block multiple on every call (e.g. N=1536 with 1024 -> a 2048-row copy + 33% extra MXU).
+    while out_block_size > compute_tile_n and int(n_out) % out_block_size != 0:
+        out_block_size //= 2
     # in (K): must be a multiple of the quantization block_size_in so that
     # each tile boundary aligns with a scale-block boundary.
     in_block_size = max(int(tuned.in_block_size), int(block_size_in))
