@@ -115,10 +115,11 @@ class BaseReasoningFormatDetector:
             else:
                 return StreamingParseResult()
 
-        # If we're not in a reasoning block return as normal text
+        # If we're not in a reasoning block return as normal text. Return the whole buffer:
+        # an earlier chunk held back as a possible tag prefix (e.g. "<" or "</") is part of it.
         if not self._in_reasoning:
             self._buffer = ""
-            return StreamingParseResult(normal_text=new_text)
+            return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult()
 
