@@ -303,6 +303,7 @@ class KimiDeltaAttention(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         recurrent_state_pool,
+        out_sharding=None,
     ) -> tuple[jax.Array, object]:
         del positions
 
@@ -329,7 +330,7 @@ class KimiDeltaAttention(nnx.Module):
         output_gate, _ = self.g_b_proj(g_a)
         output_gate = output_gate.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
         o = self.o_norm(o, output_gate).reshape(hidden_states.shape[0], self.projection_size)
-        o, _ = self.o_proj(o)
+        o, _ = self.o_proj(o, out_sharding=out_sharding)
 
         return o, recurrent_state_pool
 

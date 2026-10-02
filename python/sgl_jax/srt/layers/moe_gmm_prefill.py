@@ -59,8 +59,11 @@ def gmm_prefill_moe(
     swiglu_limit: float | None,
     shared_swiglu_limit: float | None,
     act_quant: bool,
+    scatter_tokens: bool = False,
 ):
-    """``hidden_states`` [T, H] (any sharding); returns [T, H] replicated over the mesh.
+    """``hidden_states`` [T, H] (any sharding); returns [T, H] replicated over the mesh, or
+    token-sharded over ('data', 'tensor') with ``scatter_tokens`` (reduce-scatter instead of
+    all-reduce, for sequence-parallel callers; needs T divisible by the mesh size).
 
     ``w1/w3`` [E, H, I], ``w2`` [E, I, H] expert-sharded over ('data', 'tensor'); block scales
     [E, K // qbk, 1, N]; shared expert [H, Is] / [Is, H] with per-channel scales (1, 1, Is) /
@@ -109,12 +112,16 @@ def gmm_prefill_moe(
             if split_shared:  # each device adds the shared expert for its slice of tokens
                 rows = T // n_shards
                 xr = jax.lax.dynamic_slice_in_dim(x, d * rows, rows, axis=0)
-                se = _shared_expert(xr, w1s, w3s, w2s, s1s, s3s, s2s, shared_swiglu_limit, out_dtype)
+                se = _shared_expert(
+                    xr, w1s, w3s, w2s, s1s, s3s, s2s, shared_swiglu_limit, out_dtype
+                )
                 cur = jax.lax.dynamic_slice_in_dim(out, d * rows, rows, axis=0)
                 out = jax.lax.dynamic_update_slice_in_dim(out, cur + se, d * rows, axis=0)
             else:
                 se = _shared_expert(x, w1s, w3s, w2s, s1s, s3s, s2s, shared_swiglu_limit, out_dtype)
                 out = out + jnp.where(d == 0, se, jnp.zeros_like(se))
+        if scatter_tokens:
+            return jax.lax.psum_scatter(out, _AXES, scatter_dimension=0, tiled=True)
         return jax.lax.psum(out, _AXES)
 
     # Token-major inputs are consumed replicated (every device routes all tokens).
@@ -123,13 +130,29 @@ def gmm_prefill_moe(
         jax.sharding.reshard(a, replicated) for a in (hidden_states, topk_weights, topk_ids)
     )
     args = (
-        hidden_states, topk_weights, topk_ids, w1, w3, w2, w1_scale, w3_scale, w2_scale,
-        w1_shared, w3_shared, w2_shared, w1_shared_scale, w3_shared_scale, w2_shared_scale,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w1,
+        w3,
+        w2,
+        w1_scale,
+        w3_scale,
+        w2_scale,
+        w1_shared,
+        w3_shared,
+        w2_shared,
+        w1_shared_scale,
+        w3_shared_scale,
+        w2_shared_scale,
     )
     rep = lambda a: P(*([None] * a.ndim))
     exp = lambda a: P(_AXES, *([None] * (a.ndim - 1)))
     specs = (
-        rep(hidden_states), rep(topk_weights), rep(topk_ids), *(exp(a) for a in args[3:9]),
+        rep(hidden_states),
+        rep(topk_weights),
+        rep(topk_ids),
+        *(exp(a) for a in args[3:9]),
         *(None if a is None else rep(a) for a in args[9:]),
     )
     present = [i for i, a in enumerate(args) if a is not None]  # shard_map takes no None leaves
@@ -144,6 +167,6 @@ def gmm_prefill_moe(
         _bound,
         mesh=mesh,
         in_specs=tuple(specs[i] for i in present),
-        out_specs=P(None, None),
+        out_specs=P(_AXES, None) if scatter_tokens else P(None, None),
         check_vma=False,
     )(*[args[i] for i in present])

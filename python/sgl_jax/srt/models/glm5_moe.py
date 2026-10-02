@@ -628,6 +628,7 @@ class Glm5Attention(nnx.Module):
         dsa_topk_in: jax.Array | None = None,
         dsa_topk_pages_in: jax.Array | None = None,
         dsa_topk_reuse: bool = False,
+        out_sharding=None,
     ) -> tuple[jax.Array, jax.Array]:
         q_compressed, _ = self.q_a_proj(hidden_states)
         q_compressed = self.q_a_layernorm(q_compressed)
@@ -675,7 +676,7 @@ class Glm5Attention(nnx.Module):
                 q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
             )
 
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, out_sharding=out_sharding)
         return output, kv_fused
 
 

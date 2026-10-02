@@ -600,17 +600,31 @@ class FusedEPMoEV2(FusedEPMoE):
             from sgl_jax.srt.layers.moe_gmm_prefill import gmm_prefill_moe
 
             val = lambda p: None if p is None else p.value
+            spec = getattr(out_sharding, "spec", None)
+            scatter = spec is not None and len(spec) > 0 and spec[0] == ("data", "tensor")
             output = gmm_prefill_moe(
-                self.mesh, hidden_states, topk_weights, topk_ids,
-                self.w1.value, self.w3.value, self.w2.value,
-                self.w1_scale.value, self.w3_scale.value, self.w2_scale.value,
-                val(self.w1_shared), val(self.w3_shared), val(self.w2_shared),
-                val(self.w1_shared_scale), val(self.w3_shared_scale), val(self.w2_shared_scale),
+                self.mesh,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                self.w1.value,
+                self.w3.value,
+                self.w2.value,
+                self.w1_scale.value,
+                self.w3_scale.value,
+                self.w2_scale.value,
+                val(self.w1_shared),
+                val(self.w3_shared),
+                val(self.w2_shared),
+                val(self.w1_shared_scale),
+                val(self.w3_shared_scale),
+                val(self.w2_shared_scale),
                 top_k=self.num_experts_per_tok,
                 swiglu_limit=swiglu_limit,
                 shared_swiglu_limit=shared_swiglu_limit,
                 act_quant=self.activation_quantized_dtype is not None
                 and self.enable_act_quant_cfg is not False,
+                scatter_tokens=scatter,
             )
             return jax.sharding.reshard(
                 output, out_sharding or jax.sharding.NamedSharding(self.mesh, P("data", None))

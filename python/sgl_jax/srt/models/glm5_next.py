@@ -23,6 +23,7 @@ there for the math and its provenance.
 from __future__ import annotations
 
 import logging
+import os
 
 import jax
 import jax.numpy as jnp
@@ -35,7 +36,7 @@ from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.models.glm5_moe import (
     Glm5Attention,
@@ -137,9 +138,32 @@ class Glm5NextHC(nnx.Module):
         return out.reshape(*lead, hc * d).astype(streams.dtype)
 
 
+def _prefill_sp_sharding(mesh, forward_batch: ForwardBatch, num_tokens: int):
+    """Token sharding for sequence-parallel prefill, or None.
+
+    Large EXTEND batches keep the mHC residual streams sharded over tokens across the whole
+    mesh: sublayer outputs are reduce-scattered (same bytes as the all-reduce), so mHC mixing
+    and norms run on 1/n of the tokens per device instead of redundantly on all of them, and
+    the normalized sublayer input is all-gathered for attention / MoE. Decode-sized batches
+    stay replicated (there the extra collective hop costs more than the elementwise work).
+    """
+    from sgl_jax.srt.layers.fused_moe import _GMM_MIN_TOKENS
+
+    n = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
+    if (
+        forward_batch.forward_mode != ForwardMode.EXTEND
+        or num_tokens < _GMM_MIN_TOKENS
+        or num_tokens % n
+        or os.environ.get("SGL_JAX_PREFILL_SP", "1") == "0"
+    ):
+        return None
+    return NamedSharding(mesh, P(("data", "tensor"), None))
+
+
 class Glm5NextDecoderLayer(nnx.Module):
     def __init__(self, config: Glm5NextConfig, mesh, layer_id: int = 0, dtype=jnp.bfloat16):
         self.layer_id = layer_id
+        self.mesh = mesh
         self.is_kda = config.is_kda_layer(layer_id)
         self.swiglu_limit = config.swiglu_limit
 
@@ -234,13 +258,22 @@ class Glm5NextDecoderLayer(nnx.Module):
         dispatch_info=None,
         dsa_topk_in=None,
         dsa_topk_pages_in=None,
+        sp=None,
     ):
+        """``sp``: token sharding of the residual streams (sequence-parallel prefill, see
+        _prefill_sp_sharding) or None (replicated)."""
+        replicated = NamedSharding(self.mesh, P("data", None)) if sp is not None else None
+
         # ---- attention sublayer ----
         h, hc_state = self.hc_attn.pre(hidden_states)
         h = self.input_layernorm(h)
 
+        if sp is not None:
+            h = jax.sharding.reshard(h, replicated)  # attention runs on all tokens
         if self.is_kda:
-            attn_out, attn_state = self.self_attn(positions, h, forward_batch, recurrent_state_pool)
+            attn_out, attn_state = self.self_attn(
+                positions, h, forward_batch, recurrent_state_pool, out_sharding=sp
+            )
         else:
             attn_out, attn_state = self.self_attn(
                 positions,
@@ -249,6 +282,7 @@ class Glm5NextDecoderLayer(nnx.Module):
                 token_to_kv_pool,
                 dsa_topk_in=dsa_topk_in,
                 dsa_topk_pages_in=dsa_topk_pages_in,
+                out_sharding=sp,
             )
 
         hidden_states = self.hc_attn.post(attn_out, hc_state, hidden_states)
@@ -264,10 +298,18 @@ class Glm5NextDecoderLayer(nnx.Module):
             # SwiGLU clamp on the routed and (in-kernel) shared experts.
             limit = self.swiglu_limit
             mlp_out = self.mlp(
-                h, topk_weights, topk_ids, swiglu_limit=limit, shared_swiglu_limit=limit
+                h,
+                topk_weights,
+                topk_ids,
+                swiglu_limit=limit,
+                shared_swiglu_limit=limit,
+                out_sharding=sp,
             )
         else:
-            mlp_out = self.mlp(h)
+            if sp is not None:
+                mlp_out = jax.sharding.reshard(self.mlp(jax.sharding.reshard(h, replicated)), sp)
+            else:
+                mlp_out = self.mlp(h)
             topk_ids = None
 
         hidden_states = self.hc_ffn.post(mlp_out, hc_state, hidden_states)
@@ -294,11 +336,16 @@ class Glm5NextModel(nnx.Module):
         self.norm = RMSNorm(
             config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype, scope_name="norm"
         )
+        self.mesh = mesh
 
     def __call__(self, forward_batch: ForwardBatch, memory_pools):
         hc = self.config.hc_mult
         # mHC keeps hc parallel residual streams: broadcast the embedding across the hc axis.
         hidden_states = jnp.tile(self.embed_tokens(forward_batch.input_ids), (1, hc))
+        sp = _prefill_sp_sharding(self.mesh, forward_batch, hidden_states.shape[0])
+        if sp is not None:
+            stream_sharding = jax.typeof(hidden_states).sharding
+            hidden_states = jax.sharding.reshard(hidden_states, sp)
         layers_kv_fused, layers_idx_fused, layers_topk_ids = [], [], []
         layers_recurrent, layers_conv = [], []
         dsa_topk, dsa_topk_pages = None, None
@@ -313,6 +360,7 @@ class Glm5NextModel(nnx.Module):
                 dispatch_info=forward_batch.expert_location_metadata,
                 dsa_topk_in=dsa_topk,
                 dsa_topk_pages_in=dsa_topk_pages,
+                sp=sp,
             )
             if layer.is_kda:
                 rec_buf, conv_buf_list = attn_state
@@ -328,6 +376,8 @@ class Glm5NextModel(nnx.Module):
                     dsa_topk_pages = attn_state.topk_pages
             layers_topk_ids.append(topk_ids)
 
+        if sp is not None:
+            hidden_states = jax.sharding.reshard(hidden_states, stream_sharding)
         # Collapse the hc streams into one before the final norm: mean over the hc axis.
         hidden_states = hidden_states.reshape(hidden_states.shape[0], hc, -1).mean(axis=1)
         hidden_states = self.norm(hidden_states)
