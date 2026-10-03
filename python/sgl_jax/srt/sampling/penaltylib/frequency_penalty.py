@@ -36,6 +36,9 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
         batch_indices = np.arange(len(output_ids))
         self.token_frequencies[batch_indices, output_ids] += 1
 
+    def _cumulate_token_rows(self, rows: np.ndarray, toks: np.ndarray, counts: np.ndarray):
+        np.add.at(self.token_frequencies, (rows, toks), 1)
+
     def compute_penalty(self) -> np.ndarray:
         """
         Compute and return the frequency penalty array.

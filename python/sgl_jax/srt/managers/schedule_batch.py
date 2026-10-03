@@ -481,6 +481,8 @@ class Req:
         # The number of accepted tokens in speculative decoding for this request.
         # This is used to compute the acceptance rate and average acceptance length per request.
         self.spec_accepted_tokens = 0
+        # Output tokens already fed to the penalty counters on the speculative path.
+        self.spec_penalty_fed = 0
 
         # For metrics
         self.has_log_time_stats: bool = False
@@ -796,6 +798,7 @@ class Req:
         self.recurrent_ping_pong_track_buffer = None
         self.recurrent_next_track_idx = None
         self.recurrent_last_track_seqlen = None
+        self.spec_penalty_fed = 0
 
     @property
     def disagg_transport_id(self) -> str:
@@ -1853,6 +1856,16 @@ class ScheduleBatch:
             per_rank_spec = self._split_spec_info_per_rank(flat_spec, real_bs_per_dp)
             for r, s in enumerate(per_rank_spec):
                 self.reqs_info[r].spec_info = s
+            for info in self.reqs_info:
+                orch = info.sampling_info.penalizer_orchestrator if info.sampling_info else None
+                if info.reqs and orch is not None and orch.is_required:
+                    # Penalties see every token a request has produced so far (a speculative
+                    # round appends several; under overlap the newest round lands next time).
+                    info.sampling_info.penalizer_orchestrator.cumulate_output_token_lists(
+                        [r.output_ids[r.spec_penalty_fed :] for r in info.reqs]
+                    )
+                    for r in info.reqs:
+                        r.spec_penalty_fed = len(r.output_ids)
             if self.tree_cache is not None and self.tree_cache.recurrent_extra_buffer_active():
                 # The round decides on device whether a request's accepted prefix crosses a
                 # track boundary (it then snapshots into this slot); the host records the

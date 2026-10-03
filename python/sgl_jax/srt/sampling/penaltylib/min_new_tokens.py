@@ -62,6 +62,9 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         # Simple numpy increment for CPU operations
         self.len_output_tokens = self.len_output_tokens + 1
 
+    def _cumulate_token_rows(self, rows: np.ndarray, toks: np.ndarray, counts: np.ndarray):
+        self.len_output_tokens = self.len_output_tokens + counts.reshape(-1, 1)
+
     def compute_penalty(self) -> np.ndarray:
         """
         Compute and return the min new tokens penalty array.

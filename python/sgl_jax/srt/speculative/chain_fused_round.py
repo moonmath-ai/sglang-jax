@@ -18,6 +18,7 @@ generic loop's ``GenerationBatchResult`` so the scheduler is unchanged.
 Scope: NEXTN / EAGLE with one draft model, topk == 1, num_draft_tokens == num_steps + 1,
 dp_size == 1, MLA-family attention on both models, no logprobs.
 """
+
 from __future__ import annotations
 
 import logging
@@ -38,7 +39,10 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackendMetadata,
     LinearRecurrentAttnBackendMetadata,
 )
-from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend, MLAAttentionMetadata
+from sgl_jax.srt.layers.attention.mla_backend import (
+    MLAAttentionBackend,
+    MLAAttentionMetadata,
+)
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
 from sgl_jax.srt.mem_cache.recurrent_state_pool import _commit_speculative_state
@@ -59,7 +63,6 @@ from sgl_jax.srt.speculative.spec_utils import (
     apply_simulated_acceptance,
 )
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
-from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +93,9 @@ def _run_model(model_def, state_def, leaves, forward_batch, pools, logits_metada
     return output, pool_updates
 
 
-def _accept_greedy(logits, draft_tokens, retrive_index, retrive_next_token,
-                   retrive_next_sibling, *, steps, T):
+def _accept_greedy(
+    logits, draft_tokens, retrive_index, retrive_next_token, retrive_next_sibling, *, steps, T
+):
     return verify_tree_greedy(
         speculative_num_steps=steps,
         num_draft_tokens=T,
@@ -103,8 +107,20 @@ def _accept_greedy(logits, draft_tokens, retrive_index, retrive_next_token,
     )
 
 
-def _accept_sampling(logits, draft_tokens, temperatures, top_ks, top_ps, key, *, steps, T,
-                     use_top_p, threshold_single, threshold_acc):
+def _accept_sampling(
+    logits,
+    draft_tokens,
+    temperatures,
+    top_ks,
+    top_ps,
+    key,
+    *,
+    steps,
+    T,
+    use_top_p,
+    threshold_single,
+    threshold_acc,
+):
     """Target-only speculative sampling for a topk=1 chain, vectorized.
 
     Same rule as ``tree_speculative_sampling_target_only`` (draft probs treated as 0):
@@ -161,15 +177,37 @@ def _unpack(blob, layout, name):
 
 
 def _fused_round(
-    tgt_def, tgt_state_def, tgt_leaves, tgt_pools,
-    dr_def, dr_state_def, dr_leaves, dr_pools,
-    elm, int_blob, f32_blob, hidden, base_key, relay,
-    *, layout, steps, T, bs, threshold_single, threshold_acc, mesh, use_relay, track_interval,
-    tgt_backend_def, dr_backend_def,
+    tgt_def,
+    tgt_state_def,
+    tgt_leaves,
+    tgt_pools,
+    dr_def,
+    dr_state_def,
+    dr_leaves,
+    dr_pools,
+    elm,
+    int_blob,
+    f32_blob,
+    hidden,
+    base_key,
+    relay,
+    penalty,
+    *,
+    layout,
+    steps,
+    T,
+    bs,
+    threshold_single,
+    threshold_acc,
+    mesh,
+    use_relay,
+    track_interval,
+    tgt_backend_def,
+    dr_backend_def,
 ):
     rep = NamedSharding(mesh, P())
     data = NamedSharding(mesh, P("data"))
-    I = lambda name: _unpack(int_blob, layout, name)  # noqa: E731
+    I = lambda name: _unpack(int_blob, layout, name)  # noqa: E731, E741
     F = lambda name: _unpack(f32_blob, layout, name)  # noqa: E731
     D = lambda x: jax.sharding.reshard(x, data)  # noqa: E731
 
@@ -200,17 +238,25 @@ def _fused_round(
     # Metadata: host-built, length-independent layout + lengths derived here from seq_lens
     # (MLAAttentionBackend.spec_chain_layout / spec_chain_lengths).
     verified_seq_lens = jnp.where(valid, seq_lens - 1, 0)
-    chain_kv, req_seq = MLAAttentionBackend.spec_chain_lengths(
-        verified_seq_lens, valid, T, xp=jnp
-    )
+    chain_kv, req_seq = MLAAttentionBackend.spec_chain_lengths(verified_seq_lens, valid, T, xp=jnp)
     chain_md = MLAAttentionMetadata(
-        D(I("chain_cu_q")), D(I("chain_cu_kv")), D(I("chain_pi")), D(chain_kv),
-        D(I("chain_dist")), D(req_seq), D(I("req_pi")), D(I("req_cuq")), D(I("req_dist")),
+        D(I("chain_cu_q")),
+        D(I("chain_cu_kv")),
+        D(I("chain_pi")),
+        D(chain_kv),
+        D(I("chain_dist")),
+        D(req_seq),
+        D(I("req_pi")),
+        D(I("req_cuq")),
+        D(I("req_dist")),
     )
     dr_step_mds = [
         MLAAttentionMetadata(
-            D(I("step_cu_q")), D(I("step_cu_kv")), D(I("step_pi")),
-            D(jnp.where(valid, seq_lens + i, 0).astype(jnp.int32)), D(I("step_dist")),
+            D(I("step_cu_q")),
+            D(I("step_cu_kv")),
+            D(I("step_pi")),
+            D(jnp.where(valid, seq_lens + i, 0).astype(jnp.int32)),
+            D(I("step_dist")),
         )
         for i in range(steps - 1)
     ]
@@ -221,18 +267,28 @@ def _fused_round(
         tgt_backend.forward_metadata = HybridLinearAttnBackendMetadata(
             full_attn_metadata=chain_md,
             linear_attn_metadata=LinearRecurrentAttnBackendMetadata(
-                cu_q_lens=D(I("kda_cu_q")), recurrent_indices=D(recurrent_indices),
-                has_initial_state=D(I("has_initial_state")) != 0),
+                cu_q_lens=D(I("kda_cu_q")),
+                recurrent_indices=D(recurrent_indices),
+                has_initial_state=D(I("has_initial_state")) != 0,
+            ),
         )
     else:
         tgt_backend.forward_metadata = chain_md
     dr_backend = jax.tree_util.tree_unflatten(dr_backend_def, [])
 
     def fb(mode, n, backend):
-        return ForwardBatch(bid=0, forward_mode=mode, batch_size=n, input_ids=None,
-                            req_pool_indices=None, seq_lens=None, out_cache_loc=None,
-                            attn_backend=backend, expert_location_metadata=elm,
-                            capture_hidden_mode=CaptureHiddenMode.FULL)
+        return ForwardBatch(
+            bid=0,
+            forward_mode=mode,
+            batch_size=n,
+            input_ids=None,
+            req_pool_indices=None,
+            seq_lens=None,
+            out_cache_loc=None,
+            attn_backend=backend,
+            expert_location_metadata=elm,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
 
     tgt_fb_verify = fb(ForwardMode.TARGET_VERIFY, bs * T, tgt_backend)
     dr_fb_step = fb(ForwardMode.DECODE, bs, dr_backend)
@@ -241,8 +297,9 @@ def _fused_round(
     # ---- draft: num_steps - 1 decode forwards of the MTP block ----
     tokens = [first_draft_token]
     tok, h = first_draft_token, hidden
-    lm_step = LogitsMetadata(forward_mode=ForwardMode.DECODE,
-                             capture_hidden_mode=CaptureHiddenMode.LAST)
+    lm_step = LogitsMetadata(
+        forward_mode=ForwardMode.DECODE, capture_hidden_mode=CaptureHiddenMode.LAST
+    )
     for i in range(steps - 1):
         dr_fb_step.attn_backend.forward_metadata = dr_step_mds[i]
         dr_fb_step.input_ids = tok
@@ -264,23 +321,43 @@ def _fused_round(
     retrive_next_sibling = packed[4].reshape(bs, T)
     tgt_fb_verify.input_ids = draft_tokens
     tgt_fb_verify.positions = positions
-    lm_verify = LogitsMetadata(forward_mode=ForwardMode.TARGET_VERIFY,
-                               capture_hidden_mode=CaptureHiddenMode.FULL)
-    out, tgt_updates = _run_model(tgt_def, tgt_state_def, tgt_leaves, tgt_fb_verify, tgt_pools,
-                                  lm_verify)
+    lm_verify = LogitsMetadata(
+        forward_mode=ForwardMode.TARGET_VERIFY, capture_hidden_mode=CaptureHiddenMode.FULL
+    )
+    out, tgt_updates = _run_model(
+        tgt_def, tgt_state_def, tgt_leaves, tgt_fb_verify, tgt_pools, lm_verify
+    )
     logits = jax.sharding.reshard(out.next_token_logits, rep)
+    # Presence / frequency penalties: each request's accumulated additive penalty applies to
+    # all its chain positions (as upstream's verify does); zeros when no request uses them.
+    logits = logits + jnp.repeat(penalty, T, axis=0).astype(logits.dtype)
     target_hidden = jax.sharding.reshard(out.hidden_states, rep)
 
     # One executable per bucket: greedy vs sampling (and top-p) are runtime flags.
     accept_index, accept_length, predict = jax.lax.cond(
         is_greedy,
         lambda: _accept_greedy(
-            logits, draft_tokens, retrive_index, retrive_next_token, retrive_next_sibling,
-            steps=steps, T=T),
+            logits,
+            draft_tokens,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            steps=steps,
+            T=T,
+        ),
         lambda: _accept_sampling(
-            logits, draft_tokens, temperatures, top_ks, top_ps, key, steps=steps, T=T,
-            use_top_p=use_top_p, threshold_single=threshold_single,
-            threshold_acc=threshold_acc),
+            logits,
+            draft_tokens,
+            temperatures,
+            top_ks,
+            top_ps,
+            key,
+            steps=steps,
+            T=T,
+            use_top_p=use_top_p,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+        ),
     )
     accept_length = (accept_length + 1).astype(jnp.int32)
     if SIMULATED_ACCEPTANCE_CONFIG.enabled:
@@ -324,13 +401,18 @@ def _fused_round(
                 ),
             )
         new_rec, new_conv = _commit_speculative_state(
-            rsp.recurrent_buffers, rsp.conv_buffers,
+            rsp.recurrent_buffers,
+            rsp.conv_buffers,
             jax.sharding.reshard(recurrent_indices, data),
             jax.sharding.reshard(accept_length, data),
-            mesh=mesh, data_axis=rsp.data_partition_axis,
-            recurrent_axis=rsp.recurrent_partition_axis, conv_axis=rsp.conv_partition_axis,
+            mesh=mesh,
+            data_axis=rsp.data_partition_axis,
+            recurrent_axis=rsp.recurrent_partition_axis,
+            conv_axis=rsp.conv_partition_axis,
             conv_tiled=getattr(rsp, "conv_tiled", False),
-            lazy_commit=getattr(rsp, "lazy_commit", False), **track)
+            lazy_commit=getattr(rsp, "lazy_commit", False),
+            **track,
+        )
         tgt_updates = dict(tgt_updates)
         tgt_updates["recurrent_state_pool"] = (new_rec, new_conv)
 
@@ -356,8 +438,7 @@ def _fused_round(
         logits_indices=extend_logits_indices,
         accept_lens=accept_length,
     )
-    out, dr_updates = _run_model(dr_def, dr_state_def, dr_leaves, dr_fb_extend, dr_pools,
-                                 lm_extend)
+    out, dr_updates = _run_model(dr_def, dr_state_def, dr_leaves, dr_fb_extend, dr_pools, lm_extend)
     ext_logits = jax.sharding.reshard(out.next_token_logits, rep)
     ext_hidden_all = jax.sharding.reshard(out.hidden_states, rep)
     select_index = jnp.arange(bs, dtype=jnp.int32) * T + jnp.maximum(accept_length - 1, 0)
@@ -370,16 +451,31 @@ def _fused_round(
     top_index = top_index.astype(jnp.int32)
     new_relay = None
     if use_relay:
-        relay_topk = jnp.zeros((bs, relay.topk_index.shape[-1]), jnp.int32).at[:, 0].set(
-            top_index[:, 0])
-        new_relay = update_spec_relay_buffers(
-            relay, D(future_indices), D(valid), D(relay_topk),
-            jax.sharding.reshard(next_hidden.astype(relay.hidden_states.dtype),
-                                 NamedSharding(mesh, P("data", None))),
-            D(next_verified_id), D(new_seq_lens.astype(jnp.int32)), dp_size=1,
+        relay_topk = (
+            jnp.zeros((bs, relay.topk_index.shape[-1]), jnp.int32).at[:, 0].set(top_index[:, 0])
         )
-    host_outputs = (predict, accept_length, verified_flat, next_verified_id, topk_p,
-                    top_index, next_hidden, new_seq_lens)
+        new_relay = update_spec_relay_buffers(
+            relay,
+            D(future_indices),
+            D(valid),
+            D(relay_topk),
+            jax.sharding.reshard(
+                next_hidden.astype(relay.hidden_states.dtype), NamedSharding(mesh, P("data", None))
+            ),
+            D(next_verified_id),
+            D(new_seq_lens.astype(jnp.int32)),
+            dp_size=1,
+        )
+    host_outputs = (
+        predict,
+        accept_length,
+        verified_flat,
+        next_verified_id,
+        topk_p,
+        top_index,
+        next_hidden,
+        new_seq_lens,
+    )
     return tgt_updates, dr_updates, host_outputs, new_relay
 
 
@@ -393,6 +489,8 @@ class ChainFusedRound:
         self.mesh = spec_worker.mesh
         self._key = jax.random.PRNGKey(spec_worker.server_args.random_seed or 0)
         self._round_id = 0
+        self._vocab_size = spec_worker.target_worker.model_config.vocab_size
+        self._zero_penalty = {}
         sa = spec_worker.server_args
         # Track-boundary snapshots for the extra-buffer radix cache (0: off).
         self.track_interval = (
@@ -406,10 +504,12 @@ class ChainFusedRound:
             "SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD"
         ):
             # Every forward in the round is decode-shaped (see aot_dispatch).
-            compiler_options.update({
-                "xla_tpu_offload_gather_to_sparsecore": "false",
-                "xla_tpu_offload_all_supported_gathers_to_sparsecore": "false",
-            })
+            compiler_options.update(
+                {
+                    "xla_tpu_offload_gather_to_sparsecore": "false",
+                    "xla_tpu_offload_all_supported_gathers_to_sparsecore": "false",
+                }
+            )
         compiler_options = compiler_options or None
         # Backends enter the JIT as structure only (empty metadata): per-round metadata is
         # rebuilt in-JIT from the packed upload, so stale host metadata never reaches the
@@ -419,11 +519,40 @@ class ChainFusedRound:
         self._jit = jax.jit(
             partial(_fused_round, tgt_backend_def=tgt_def, dr_backend_def=dr_def),
             donate_argnames=("tgt_pools", "dr_pools"),
-            static_argnames=("tgt_state_def", "dr_state_def", "layout", "steps", "T", "bs",
-                             "threshold_single", "threshold_acc", "mesh", "use_relay",
-                             "track_interval"),
+            static_argnames=(
+                "tgt_state_def",
+                "dr_state_def",
+                "layout",
+                "steps",
+                "T",
+                "bs",
+                "threshold_single",
+                "threshold_acc",
+                "mesh",
+                "use_relay",
+                "track_interval",
+            ),
             compiler_options=compiler_options,
         )
+
+    def _penalty(self, sampling_info, bs, sharding):
+        """[bs, vocab] additive penalty for the verify logits: the batch's presence /
+        frequency penalties when any request sets them, else a cached device zeros buffer
+        (same shape, so no extra executable and no per-round upload)."""
+        pen = getattr(sampling_info, "linear_penalty", None)
+        orch = getattr(sampling_info, "penalizer_orchestrator", None)
+        if pen is None and orch is not None and orch.is_required:
+            pen = orch.apply()
+        if pen is None or getattr(pen, "size", 0) == 0:
+            if bs not in self._zero_penalty:
+                self._zero_penalty[bs] = jax.device_put(
+                    np.zeros((bs, self._vocab_size), np.float32), sharding
+                )
+            return self._zero_penalty[bs]
+        pen = np.asarray(pen, np.float32)
+        if pen.shape[0] < bs:
+            pen = np.concatenate([pen, np.zeros((bs - pen.shape[0], pen.shape[1]), np.float32)])
+        return jax.device_put(pen[:bs], sharding)
 
     def supports_batch(self, mwb) -> bool:
         return not (mwb.return_logprob or getattr(mwb, "return_output_logprob_only", False))
@@ -465,22 +594,31 @@ class ChainFusedRound:
 
         sampling_info = mwb.sampling_info
         is_greedy = bool(sampling_info.is_all_greedy)
-        temperatures = _pad_rows(np.asarray(sampling_info.temperatures, np.float32).reshape(-1),
-                                 bs, 1.0)
+        temperatures = _pad_rows(
+            np.asarray(sampling_info.temperatures, np.float32).reshape(-1), bs, 1.0
+        )
         top_ks = _pad_rows(np.asarray(sampling_info.top_ks, np.int32).reshape(-1), bs, 1)
         top_ps = _pad_rows(np.asarray(sampling_info.top_ps, np.float32).reshape(-1), bs, 1.0)
         use_top_p = bool(np.any(top_ps[sel] < 1.0))
 
         rep = NamedSharding(self.mesh, P())
+        penalty = self._penalty(sampling_info, bs, rep)
         self._round_id += 1
         cu_q, cu_kv, pi, dist = layout_arrays["chain"]
         req_pi, req_cuq, req_dist = layout_arrays["req"]
         s_cu_q, s_cu_kv, s_pi, s_dist = layout_arrays["step"]
         named_int = [
             ("valid", valid.astype(np.int32)),
-            ("chain_cu_q", cu_q), ("chain_cu_kv", cu_kv), ("chain_pi", pi), ("chain_dist", dist),
-            ("req_pi", req_pi), ("req_cuq", req_cuq), ("req_dist", req_dist),
-            ("step_cu_q", s_cu_q), ("step_cu_kv", s_cu_kv), ("step_pi", s_pi),
+            ("chain_cu_q", cu_q),
+            ("chain_cu_kv", cu_kv),
+            ("chain_pi", pi),
+            ("chain_dist", dist),
+            ("req_pi", req_pi),
+            ("req_cuq", req_cuq),
+            ("req_dist", req_dist),
+            ("step_cu_q", s_cu_q),
+            ("step_cu_kv", s_cu_kv),
+            ("step_pi", s_pi),
             ("step_dist", s_dist),
             ("kda_cu_q", np.arange(bs + 1, dtype=np.int32) * T),  # unused by the chain kernel
             ("recurrent_indices", np.asarray(recurrent_indices, np.int32)),
@@ -523,15 +661,32 @@ class ChainFusedRound:
 
         with jax.set_mesh(self.mesh):
             tgt_updates, dr_updates, outs, new_relay = self._jit(
-                tmr._model_def, tmr._model_state_def, tmr.model_state_leaves, tmr.memory_pools,
-                dmr._model_def, dmr._model_state_def, dmr.model_state_leaves, dmr.memory_pools,
-                get_global_expert_location_metadata(), int_dev, f32_dev, hidden, self._key,
+                tmr._model_def,
+                tmr._model_state_def,
+                tmr.model_state_leaves,
+                tmr.memory_pools,
+                dmr._model_def,
+                dmr._model_state_def,
+                dmr.model_state_leaves,
+                dmr.memory_pools,
+                get_global_expert_location_metadata(),
+                int_dev,
+                f32_dev,
+                hidden,
+                self._key,
                 relay,
-                layout=_Layout(layout_key), steps=steps, T=T, bs=bs,
+                penalty,
+                layout=_Layout(layout_key),
+                steps=steps,
+                T=T,
+                bs=bs,
                 threshold_single=float(
-                    global_server_args_dict["speculative_accept_threshold_single"]),
+                    global_server_args_dict["speculative_accept_threshold_single"]
+                ),
                 threshold_acc=float(global_server_args_dict["speculative_accept_threshold_acc"]),
-                mesh=self.mesh, use_relay=overlap, track_interval=self.track_interval,
+                mesh=self.mesh,
+                use_relay=overlap,
+                track_interval=self.track_interval,
             )
         tmr.memory_pools.replace_all(tgt_updates)
         dmr.memory_pools.replace_all(dr_updates)
@@ -547,8 +702,16 @@ class ChainFusedRound:
                 allocate_lens=allocate_lens,
             )
         else:
-            (predict, accept_length, verified_flat, next_verified, topk_p, topk_index,
-             next_hidden, new_seq_lens) = jax.device_get(outs)
+            (
+                predict,
+                accept_length,
+                verified_flat,
+                next_verified,
+                topk_p,
+                topk_index,
+                next_hidden,
+                new_seq_lens,
+            ) = jax.device_get(outs)
             next_draft_input = EagleDraftInput(
                 verified_id=next_verified[sel],
                 new_seq_lens=new_seq_lens,
@@ -585,8 +748,10 @@ class ChainFusedRound:
         steps = sw.spec_relay_buffers.topk_index.shape[-1]
         topk = np.zeros((bs, steps), np.int32)
         topk[sel, 0] = np.asarray(draft_input.topk_index, np.int32).reshape(len(sel), -1)[:, 0]
-        hidden = np.zeros((bs,) + tuple(np.asarray(draft_input.hidden_states).shape[1:]),
-                          np.asarray(draft_input.hidden_states).dtype)
+        hidden = np.zeros(
+            (bs,) + tuple(np.asarray(draft_input.hidden_states).shape[1:]),
+            np.asarray(draft_input.hidden_states).dtype,
+        )
         hidden[sel] = np.asarray(draft_input.hidden_states)
         vid = np.zeros(bs, np.int32)
         vid[sel] = np.asarray(jax.device_get(next_token_ids)).reshape(-1)[sel]
@@ -595,7 +760,8 @@ class ChainFusedRound:
         new_seq[sel] = np.asarray(mwb.seq_lens, np.int32)[sel] + 1
         with jax.set_mesh(self.mesh):
             sw.spec_relay_buffers = _publish_relay(
-                sw.spec_relay_buffers, future, valid, topk, hidden, vid, new_seq)
+                sw.spec_relay_buffers, future, valid, topk, hidden, vid, new_seq
+            )
         return EagleDraftInput(
             future_indices=np.asarray(mwb.req_pool_indices, np.int32)[sel],
             allocate_lens=np.asarray(mwb.seq_lens, np.int32)[sel],
@@ -608,10 +774,14 @@ def _publish_relay(relay, future, valid, topk, hidden, vid, new_seq):
     data = NamedSharding(mesh, P("data"))
     data2 = NamedSharding(mesh, P("data", None))
     return update_spec_relay_buffers(
-        relay, jax.sharding.reshard(future, data), jax.sharding.reshard(valid, data),
+        relay,
+        jax.sharding.reshard(future, data),
+        jax.sharding.reshard(valid, data),
         jax.sharding.reshard(topk, data2),
         jax.sharding.reshard(hidden.astype(relay.hidden_states.dtype), data2),
-        jax.sharding.reshard(vid, data), jax.sharding.reshard(new_seq, data), dp_size=1,
+        jax.sharding.reshard(vid, data),
+        jax.sharding.reshard(new_seq, data),
+        dp_size=1,
     )
 
 
@@ -647,8 +817,11 @@ def _pack(named, dtype):
 
 
 def _empty_backend_treedef(backend):
-    empty = (HybridLinearAttnBackendMetadata()
-             if isinstance(backend, HybridLinearAttnBackend) else type(backend.forward_metadata)())
+    empty = (
+        HybridLinearAttnBackendMetadata()
+        if isinstance(backend, HybridLinearAttnBackend)
+        else type(backend.forward_metadata)()
+    )
     saved = backend.forward_metadata
     backend.forward_metadata = empty
     try:

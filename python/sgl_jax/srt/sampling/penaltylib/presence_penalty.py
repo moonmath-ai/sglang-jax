@@ -36,6 +36,9 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
         batch_indices = np.arange(len(output_ids))
         self.token_presence[batch_indices, output_ids] = True
 
+    def _cumulate_token_rows(self, rows: np.ndarray, toks: np.ndarray, counts: np.ndarray):
+        self.token_presence[rows, toks] = True
+
     def compute_penalty(self) -> np.ndarray:
         """
         Compute and return the presence penalty array.
