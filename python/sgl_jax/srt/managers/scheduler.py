@@ -420,7 +420,9 @@ class Scheduler(
             n_mtp = getattr(target_model_config.hf_config, "num_nextn_predict_layers", None)
             if n_mtp is None:
                 # Multimodal wrappers (e.g. GLM-5.3-Flash) keep it on the text config.
-                n_mtp = getattr(target_model_config.hf_text_config, "num_nextn_predict_layers", None)
+                n_mtp = getattr(
+                    target_model_config.hf_text_config, "num_nextn_predict_layers", None
+                )
             if n_mtp is None and self.spec_algorithm.is_nextn():
                 n_mtp = server_args.speculative_num_steps
             self._spec_multi_layer = n_mtp is not None and n_mtp > 1
@@ -1281,6 +1283,18 @@ class Scheduler(
             # The speculative workers never fill next_token_logprobs; accepting the request
             # crashed the scheduler in add_logprob_return_values.
             req.set_finish_with_abort("Speculative decoding does not support return_logprob yet.")
+            self._add_request_to_queue(req)
+            return
+        elif not self.spec_algorithm.is_none() and any(
+            getattr(req.sampling_params, f, None)
+            for f in ("json_schema", "regex", "ebnf", "structural_tag")
+        ):
+            # The speculative round applies no vocab mask, so the grammar rejects the
+            # unconstrained output mid-generation; refuse up front with a clear reason.
+            req.set_finish_with_abort(
+                "Speculative decoding does not support constrained decoding (response_format, "
+                "regex, ebnf, or tool_choice='required') yet."
+            )
             self._add_request_to_queue(req)
             return
 
