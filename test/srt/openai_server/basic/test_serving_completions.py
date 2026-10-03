@@ -38,7 +38,9 @@ class ServingCompletionTestCase(unittest.TestCase):
         tm.tokenizer.bos_token_id = 1
 
         tm.model_config = Mock(is_multimodal=False)
-        tm.server_args = Mock(enable_cache_report=False)
+        tm.server_args = Mock(
+            enable_cache_report=False, model_path="", preferred_sampling_params=None
+        )
 
         tm.generate_request = AsyncMock()
         tm.create_abort_task = Mock()

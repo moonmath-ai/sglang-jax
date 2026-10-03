@@ -30,6 +30,8 @@ class _MockTokenizerManager:
             enable_cache_report=False,
             tool_call_parser="hermes",
             reasoning_parser=None,
+            model_path="",
+            preferred_sampling_params=None,
         )
         self.chat_template_name: Optional[str] = "llama-3"
 

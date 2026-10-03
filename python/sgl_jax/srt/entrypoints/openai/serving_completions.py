@@ -117,8 +117,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "skip_special_tokens": request.skip_special_tokens,
             "logit_bias": request.logit_bias,
         }
-
-        return sampling_params
+        return self._apply_model_sampling_defaults(request, sampling_params)
 
     async def _handle_streaming_request(
         self,
