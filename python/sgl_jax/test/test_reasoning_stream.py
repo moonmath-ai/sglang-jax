@@ -16,11 +16,52 @@ TEXT = (
     "a <| b </ c\n<tool_call>edit<arg_key>s</arg_key><arg_value><v>1</v>\n</p></arg_value></tool_call>"
 )
 # Token-like pieces, including standalone "<" and "</" as the GLM tokenizer produces them.
-PIECES = ["plan", " the", " edit", "</think>", "Here", ":\n", "<", "dependency", ">\n", "  <",
-          "artifactId", ">", "api", "</", "artifactId", ">\n", "</", "dependency", ">\n", "a", " <",
-          "|", " b", " </", " c", "\n", "<tool_call>", "edit", "<arg_key>", "s", "</arg_key>",
-          "<arg_value>", "<", "v", ">", "1", "</", "v", ">\n", "</", "p", ">", "</arg_value>",
-          "</tool_call>"]
+PIECES = [
+    "plan",
+    " the",
+    " edit",
+    "</think>",
+    "Here",
+    ":\n",
+    "<",
+    "dependency",
+    ">\n",
+    "  <",
+    "artifactId",
+    ">",
+    "api",
+    "</",
+    "artifactId",
+    ">\n",
+    "</",
+    "dependency",
+    ">\n",
+    "a",
+    " <",
+    "|",
+    " b",
+    " </",
+    " c",
+    "\n",
+    "<tool_call>",
+    "edit",
+    "<arg_key>",
+    "s",
+    "</arg_key>",
+    "<arg_value>",
+    "<",
+    "v",
+    ">",
+    "1",
+    "</",
+    "v",
+    ">\n",
+    "</",
+    "p",
+    ">",
+    "</arg_value>",
+    "</tool_call>",
+]
 
 
 def _stream(chunks):
@@ -43,7 +84,7 @@ def test_stream_matches_non_stream(seed):
     chunks, i = [], 0
     while i < len(PIECES):
         k = r.randint(1, 4)
-        chunks.append("".join(PIECES[i:i + k]))
+        chunks.append("".join(PIECES[i : i + k]))
         i += k
     ref_reasoning, ref_normal = ReasoningParser("glm45").parse_non_stream(TEXT)
     reasoning, normal = _stream(chunks)

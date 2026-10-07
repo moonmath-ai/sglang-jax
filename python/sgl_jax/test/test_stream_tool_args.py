@@ -59,4 +59,7 @@ def test_second_tool_call_ends_in_stop_chunk():
     text = CALL + other
     split = text.index(".ts</arg_value>")
     out = _stream([text[:split], text[split:]], n_calls=2)
-    assert out == [{"filePath": PATH}, {"filePath": PATH.replace("mona_from_memory.py", "draw_face.ts")}]
+    assert out == [
+        {"filePath": PATH},
+        {"filePath": PATH.replace("mona_from_memory.py", "draw_face.ts")},
+    ]

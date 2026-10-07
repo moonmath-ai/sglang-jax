@@ -1005,7 +1005,11 @@ def _reconcile_final_tool_args(detector, calls) -> None:
     all of this chunk's deltas for that tool -- not just the current item's.
     """
     tool_idx = calls[-1].tool_index
-    if not 0 <= tool_idx < min(len(detector.prev_tool_call_arr), len(detector.streamed_args_for_tool)):
+    if (
+        not 0
+        <= tool_idx
+        < min(len(detector.prev_tool_call_arr), len(detector.streamed_args_for_tool))
+    ):
         return
     mine = [c for c in calls if c.tool_index == tool_idx]
     pending = "".join(c.parameters for c in mine if isinstance(c.parameters, str))
