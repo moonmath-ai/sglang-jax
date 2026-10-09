@@ -320,7 +320,7 @@ suites = {
             "python/sgl_jax/test/test_mhc_kernel.py",
             0.3,
             runner="pytest",
-            env={"JAX_PLATFORMS": "cpu"},
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4"},
         ),
         TestFile(
             "test/srt/kernels/dsa/test_compute_topk_pages.py",
