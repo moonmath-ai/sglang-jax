@@ -95,7 +95,6 @@ class RecurrentStatePool:
         abstract: bool = False,
         spec_num_draft_tokens: int = 0,
         conv_tiled: bool = False,
-        lazy_commit: bool = False,
         spec_rows: int | None = None,
     ):
         """`size` is the **global** number of valid slots across all DP ranks
@@ -120,12 +119,6 @@ class RecurrentStatePool:
         ``spec_rows`` (global, divisible by ``dp_size``) bounds the verify batch for the
         batch-row-indexed scratch; it defaults to ``total_slots``. With the radix cache the pool
         holds many snapshot slots, so size it by the max running requests instead.
-
-        ``lazy_commit`` (KDA conv-fused verify, radix cache off): the verify scratch is indexed
-        by **slot** and each layer's conv list gets a 4th entry ``spec_step [slots] int32``:
-        -1 = the slot's running state is in the pool, t >= 0 = it is scratch step t. Commit
-        only records ``accepted - 1`` (no state copy); extend/decode write the pool and reset
-        the slot to -1; verify seeds from whichever holds the state.
         """
         state_dtype = recurrent_state_dtype()
         if temporal_dtype is None:
@@ -195,7 +188,6 @@ class RecurrentStatePool:
         )
         self.spec_num_draft_tokens = spec_num_draft_tokens
         self.conv_tiled = bool(conv_tiled)
-        self.lazy_commit = bool(lazy_commit) and spec_num_draft_tokens > 0
         self.spec_rows = spec_rows
         if self.conv_tiled:
             assert num_k_heads == num_heads and head_k_dim == head_dim, "tiled conv: equal q/k/v"
@@ -210,9 +202,8 @@ class RecurrentStatePool:
         self.recurrent_buffers, self.conv_buffers = self._create_buffers(abstract=abstract)
 
     def _spec_scratch_rows(self) -> int:
-        """Rows of the verify scratch: one per slot for the slot-indexed lazy commit, else the
-        verify batch bound (``spec_rows``)."""
-        if self.lazy_commit or self.spec_rows is None:
+        """Rows of the batch-row-indexed verify scratch (the verify batch bound)."""
+        if self.spec_rows is None:
             return self.total_slots
         assert self.spec_rows % self.dp_size == 0, (self.spec_rows, self.dp_size)
         return self.spec_rows
@@ -288,14 +279,6 @@ class RecurrentStatePool:
                 for inner in conv_buffers:
                     inner.append(alloc_spec_conv())
                     inner.append(alloc_spec_ssm())
-                if self.lazy_commit:
-                    step_sharding = NamedSharding(self.mesh, P(self.data_partition_axis))
-                    for inner in conv_buffers:
-                        inner.append(
-                            jax.device_put(
-                                jnp.full((self.total_slots,), -1, jnp.int32), step_sharding
-                            )
-                        )
 
         return recurrent_buffers, conv_buffers
 
@@ -340,7 +323,6 @@ class RecurrentStatePool:
             recurrent_axis=self.recurrent_partition_axis,
             conv_axis=self.conv_partition_axis,
             conv_tiled=self.conv_tiled,
-            lazy_commit=self.lazy_commit,
         )
         self.recurrent_buffers = list(new_recurrent)
         self.conv_buffers = [list(inner) for inner in new_conv]
@@ -452,7 +434,6 @@ class RecurrentStatePool:
             self.conv_sharding,
             self.spec_num_draft_tokens,
             self.conv_tiled,
-            self.lazy_commit,
             self.spec_rows,
         )
         return children, aux
@@ -479,13 +460,11 @@ class RecurrentStatePool:
             conv_sharding,
             spec_num_draft_tokens,
             conv_tiled,
-            lazy_commit,
             spec_rows,
         ) = aux_data
         obj = cls.__new__(cls)
         obj.spec_num_draft_tokens = spec_num_draft_tokens
         obj.conv_tiled = conv_tiled
-        obj.lazy_commit = lazy_commit
         obj.spec_rows = spec_rows
         obj.linear_recurrent_layer_ids = list(linear_recurrent_layer_ids_tup)
         obj.layers_mapping = {
@@ -526,7 +505,6 @@ class RecurrentStatePool:
         "recurrent_axis",
         "conv_axis",
         "conv_tiled",
-        "lazy_commit",
     ),
     donate_argnums=(0, 1),
 )
@@ -541,7 +519,6 @@ def _commit_speculative_state(
     recurrent_axis,
     conv_axis,
     conv_tiled=False,
-    lazy_commit=False,
     track_indices=None,
     track_steps=None,
 ):
@@ -553,26 +530,6 @@ def _commit_speculative_state(
     ``track_indices[b]`` (the state at the track boundary its accepted prefix crossed).
     """
     track = track_indices is not None
-    assert not (track and lazy_commit), "track snapshots need the eager commit"
-
-    if lazy_commit:
-        # Slot-indexed scratch: record the accepted step; no state is copied.
-        def _record(steps, idx, acc):
-            dst = jnp.where((idx == 0) | (acc <= 0), 0, idx)
-            return steps.at[dst].set(jnp.where(dst == 0, -1, acc - 1).astype(steps.dtype))
-
-        record = jax.shard_map(
-            _record,
-            mesh=mesh,
-            in_specs=(P(data_axis),) * 3,
-            out_specs=P(data_axis),
-            check_vma=False,
-        )
-        new_conv = [
-            list(inner[:3]) + [record(inner[3], recurrent_indices, accept_lens)]
-            for inner in conv_buffers
-        ]
-        return list(recurrent_buffers), new_conv
 
     def _select(buf, spec, idx, acc, *track_rows):
         buf = jax.lax.optimization_barrier(buf)  # donated-buffer aliasing guard, see copy_slots

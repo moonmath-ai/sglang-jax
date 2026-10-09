@@ -3,7 +3,6 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 from sgl_jax.srt.kernels.kda.chain_verify import kda_chain_verify
 from sgl_jax.srt.kernels.kda.naive import naive_recurrent_kda
@@ -87,7 +86,7 @@ def _check(o, st_rows, stc_rows, o_ref, st_ref, stc_ref):
     np.testing.assert_array_equal(np.asarray(stc_rows, np.float32), np.asarray(stc_ref, np.float32))
 
 
-def _run(c, idx, spec_step=None):
+def _run(c, idx):
     return kda_chain_verify(
         *c["x"],
         c["a"],
@@ -100,7 +99,6 @@ def _run(c, idx, spec_step=None):
         idx,
         c["st"],
         c["stc"],
-        spec_step,
         scale=K**-0.5,
         lower_bound=LOWER_BOUND,
         interpret=INTERPRET,
@@ -113,22 +111,3 @@ def test_batch_rows_scratch_matches_reference():
     o, st, stc = _run(c, idx)
     _check(o, st[:B], stc[:B], *_reference(c, c["ssm_pool"][idx], c["conv_pool"][idx]))
     np.testing.assert_array_equal(np.asarray(st[B:]), np.asarray(c["st"][B:]))  # untouched
-
-
-@pytest.mark.parametrize("steps", [(-1, -1, -1), (2, -1, 0)])
-def test_slot_rows_scratch_seeds_from_recorded_step(steps):
-    """Lazy commit: a slot with spec_step >= 0 starts from its scratch step, else the pool."""
-    c = _case(6)
-    idx = jnp.asarray([4, 1, 2], jnp.int32)
-    spec_step = np.full((SLOTS,), -1, np.int32)
-    spec_step[np.asarray(idx)] = steps
-    use = np.asarray(steps) >= 0
-    sel = lambda pool, scr: jnp.where(
-        use.reshape((-1,) + (1,) * (pool.ndim - 1)), scr[idx, np.maximum(steps, 0)], pool[idx]
-    )
-    h0 = sel(c["ssm_pool"], c["st"])
-    hist = sel(c["conv_pool"], c["stc"])
-    o, st, stc = _run(c, idx, jnp.asarray(spec_step))
-    _check(o, st[idx], stc[idx], *_reference(c, h0, hist))
-    others = np.setdiff1d(np.arange(SLOTS), np.asarray(idx))
-    np.testing.assert_array_equal(np.asarray(st[others]), np.asarray(c["st"][others]))

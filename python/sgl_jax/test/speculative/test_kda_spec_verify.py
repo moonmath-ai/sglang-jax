@@ -26,7 +26,7 @@ H, D, K, T = 2, 16, 4, 4
 HIDDEN = H * D
 
 
-def _pool(mesh, spec_T, tiled=False, lazy=False, spec_rows=None):
+def _pool(mesh, spec_T, tiled=False, spec_rows=None):
     return RecurrentStatePool(
         linear_recurrent_layer_ids=[0],
         size=4,
@@ -38,7 +38,6 @@ def _pool(mesh, spec_T, tiled=False, lazy=False, spec_rows=None):
         conv_dtype=jnp.float32,
         spec_num_draft_tokens=spec_T,
         conv_tiled=tiled,
-        lazy_commit=lazy,
         spec_rows=spec_rows,
     )
 
@@ -170,63 +169,6 @@ class TestKDASpecVerify(unittest.TestCase):
                 np.testing.assert_allclose(ssm[slot], ref_ssm[step][slot], rtol=stol, atol=stol)
                 np.testing.assert_allclose(conv[slot], ref_conv[step][slot], rtol=1e-6, atol=1e-6)
             np.testing.assert_array_equal(ssm[3:], ssm0[3:])  # slot 0 is the dummy sink
-
-    def test_lazy_commit_two_rounds(self):
-        """Slot-indexed scratch + recorded accepted step: round 2 must seed from round 1's
-        accepted scratch step, and the effective state must track sequential decode."""
-        rng = np.random.default_rng(7)
-        f = lambda *s_, scale=0.3: jnp.asarray(rng.standard_normal(s_) * scale, jnp.float32)
-        n = self.bs * T
-        r2 = [f(n, HIDDEN) for _ in range(4)] + [jax.nn.sigmoid(f(n, H, scale=1.0))]
-        r1 = [self.q, self.k, self.v, self.a, self.b]
-        acc1, acc2 = 2, 3
-        sh = NamedSharding(self.mesh, P("data"))
-        tok = lambda x, t: x.reshape(self.bs, T, *x.shape[1:])[:, t]
-        ssm0_np = np.asarray(self.ssm0)
-        with jax.set_mesh(self.mesh):
-            backend = KDAAttnBackend(mesh=self.mesh)
-            # reference: decode acc1 tokens of round 1, then all T tokens of round 2
-            ref_pool = _pool(self.mesh, 0)
-            self._init(ref_pool)
-            backend.forward_metadata = self._meta(np.arange(self.bs + 1, dtype=np.int32))
-            for t in range(acc1):
-                self._run(backend, ref_pool, ForwardMode.DECODE, *(tok(x, t) for x in r1))
-            ref_out, ref_ssm = [], []
-            for t in range(T):
-                ref_out.append(
-                    np.asarray(
-                        self._run(backend, ref_pool, ForwardMode.DECODE, *(tok(x, t) for x in r2))
-                    )
-                )
-                ref_ssm.append(np.asarray(ref_pool.recurrent_buffers[0]))
-            ref_out = np.stack(ref_out, axis=1).reshape(n, -1)
-
-            pool = _pool(self.mesh, T, tiled=True, lazy=True)
-            self.ssm0 = jnp.asarray(
-                ssm0_np
-            )  # the ref pool's commit-free run kept it alive; re-wrap
-            self._init(pool)
-            backend.forward_metadata = self._meta(np.arange(self.bs + 1, dtype=np.int32) * T)
-            idx = jax.device_put(self.indices, sh)
-            self._run(backend, pool, ForwardMode.TARGET_VERIFY, *r1)
-            pool.commit_speculative_state(
-                idx, jax.device_put(np.array([acc1, acc1, 4], np.int32), sh)
-            )
-            out2 = self._run(backend, pool, ForwardMode.TARGET_VERIFY, *r2)
-            live = slice(0, 2 * T)
-            np.testing.assert_allclose(np.asarray(out2)[live], ref_out[live], rtol=2e-2, atol=2e-2)
-            pool.commit_speculative_state(
-                idx, jax.device_put(np.array([acc2, acc2, 4], np.int32), sh)
-            )
-            steps = np.asarray(pool.conv_buffers[0][3])
-            scratch = np.asarray(pool.conv_buffers[0][2])
-            for slot in self.indices[:2]:
-                self.assertEqual(steps[slot], acc2 - 1)
-                np.testing.assert_allclose(
-                    scratch[slot, steps[slot]], ref_ssm[acc2 - 1][slot], rtol=2e-2, atol=2e-2
-                )
-            # the pool's running rows are untouched under lazy commit
-            np.testing.assert_array_equal(np.asarray(pool.recurrent_buffers[0]), ssm0_np)
 
 
 if __name__ == "__main__":

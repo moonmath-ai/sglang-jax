@@ -244,7 +244,6 @@ def _build_hybrid_pools(
     enable_recurrent_extra_buffer: bool = False,
     ping_pong_slots: int = 2,
     spec_num_draft_tokens: int = 0,
-    radix_cache_disabled: bool = False,
 ) -> tuple:
     """Build RecurrentStatePool + HybridReqToTokenPool + MemoryPools.
 
@@ -283,9 +282,6 @@ def _build_hybrid_pools(
         spec_num_draft_tokens=spec_num_draft_tokens,
         # KDA-backend models: lane-dense conv state layout (see RecurrentStatePool).
         conv_tiled=conv_tiled,
-        # Slot-indexed verify scratch, commit = record the accepted step (no state copy).
-        # Needs the radix cache off: slot copies / tracks would read a stale pool row.
-        lazy_commit=conv_tiled and radix_cache_disabled,
         # Batch-row-indexed verify scratch: rows for the largest verify batch (+1 per rank),
         # not one per pool slot (the radix cache adds many snapshot slots).
         spec_rows=max_num_reqs + dp_size,
@@ -891,7 +887,6 @@ class ModelRunnerKVCacheMixin:
                     and not self.is_draft_worker
                     else 0
                 ),
-                radix_cache_disabled=bool(self.server_args.disable_radix_cache),
             )
         else:
             self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)

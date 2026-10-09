@@ -309,16 +309,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         new_conv_full = self._scatter_conv(
             conv_buffer_list[0], recurrent_indices, recurrent_indices == 0, new_conv_packed
         )
-        rest = list(conv_buffer_list[1:])
-        if len(rest) == 3:  # lazy commit: the pool row is now the slot's running state
-            rest[2] = jax.shard_map(
-                lambda st, idx: st.at[jnp.where(idx == 0, 0, idx)].set(-1),
-                mesh=self.mesh,
-                in_specs=(P("data"), P("data")),
-                out_specs=P("data"),
-                check_vma=False,
-            )(rest[2], recurrent_indices)
-        return [new_conv_full] + rest
+        return [new_conv_full] + list(conv_buffer_list[1:])
 
     def set_ssm_track_state(self, full_recurrent, track_indices, track_mask, new_recurrent):
         """Scatter ``new_recurrent`` into the request track slots.
@@ -584,12 +575,11 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         others run the DECODE conv and recurrence one chain step at a time in XLA.
         """
         ssm_full, conv_list = self.get_layer_cache(recurrent_state_pool, layer.layer_id)
-        assert len(conv_list) in (3, 4), (
+        assert len(conv_list) == 3, (
             "TARGET_VERIFY needs the recurrent pool's speculative scratch "
             "(RecurrentStatePool(spec_num_draft_tokens=...))"
         )
-        conv_full, spec_conv_full, spec_ssm_full = conv_list[:3]
-        spec_step = conv_list[3] if len(conv_list) == 4 else None
+        conv_full, spec_conv_full, spec_ssm_full = conv_list
 
         bs = recurrent_indices.shape[0]
         T = q.shape[0] // bs
@@ -610,9 +600,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 spec_ssm_full,
                 bs,
                 T,
-                spec_step,
             )
-        assert spec_step is None, "lazy commit needs the tiled conv layout"
 
         def _conv_chain_local(x, w, cache):
             # x [B*T, D], cache [B, D, K-1] (per-shard); DECODE conv one chain step at a time.
@@ -728,7 +716,6 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         spec_ssm_full,
         bs,
         T,
-        spec_step=None,
     ):
         """Verify with conv + gate + L2 norm + recurrence in one kernel per layer: reads the
         pre-conv projections, the slot's conv history and state straight from the pool, and
@@ -749,11 +736,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
 
         def _local(q_d, k_d, v_d, a_d, b_d, a_log, dtb, *rest):
             n_cw = len(cw_args)
-            cws, (cpool, pool, idx, st, stc), step = (
-                rest[:n_cw],
-                rest[n_cw : n_cw + 5],
-                rest[n_cw + 5 :],
-            )
+            cws, (cpool, pool, idx, st, stc) = rest[:n_cw], rest[n_cw:]
             B = idx.shape[0]
             Hl = a_log.size
             if n_cw == 1:
@@ -776,7 +759,6 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 idx,
                 st,
                 stc,
-                step[0] if step else None,
                 scale=scale,
                 lower_bound=lower_bound,
             )
@@ -801,8 +783,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 P("data"),  # slot indices
                 spec_ssm_spec,
                 spec_conv_spec,
-            )
-            + ((P("data"),) if spec_step is not None else ()),
+            ),
             out_specs=(P("data", "tensor"), spec_ssm_spec, spec_conv_spec),
             check_vma=False,
         )(
@@ -819,12 +800,10 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             recurrent_indices,
             spec_ssm_full,
             spec_conv_full,
-            *((spec_step,) if spec_step is not None else ()),
         )
         return output.reshape(output.shape[0], -1), (
             ssm_full,
-            [conv_full, new_spec_conv, new_spec_ssm]
-            + ([spec_step] if spec_step is not None else []),
+            [conv_full, new_spec_conv, new_spec_ssm],
         )
 
     def _fused_kda_gate(

@@ -137,47 +137,6 @@ def _batch_rows_kernel(
     )
 
 
-def _slot_rows_kernel(
-    idx_ref,
-    step_ref,
-    ascale_ref,
-    q_ref,
-    k_ref,
-    v_ref,
-    a_ref,
-    beta_ref,
-    dtb_ref,
-    convw_ref,
-    hist_p,
-    h0_p,
-    h0_s,
-    hist_s,
-    o_ref,
-    st_ref,
-    stc_ref,
-    **kw,
-):
-    """Lazy commit: scratch rows are slots; a row whose step >= 0 holds its running state in
-    scratch step ``step`` of its slot (seed from there), else in the pool."""
-    use_s = step_ref[pl.program_id(0)] >= 0
-    _verify_body(
-        ascale_ref,
-        q_ref,
-        k_ref,
-        v_ref,
-        a_ref,
-        beta_ref,
-        dtb_ref,
-        convw_ref,
-        lambda j, c: jnp.where(use_s, hist_s[0, 0, j, c], hist_p[0, j, c]),
-        lambda h: jnp.where(use_s, h0_s[0, 0, h], h0_p[0, h]),
-        o_ref,
-        st_ref,
-        stc_ref,
-        **kw,
-    )
-
-
 @functools.partial(jax.jit, static_argnames=("scale", "lower_bound", "g_dtype", "interpret"))
 def kda_chain_verify(
     q,
@@ -193,7 +152,6 @@ def kda_chain_verify(
     slot_idx,
     step_states,
     step_conv,
-    spec_step=None,
     *,
     scale,
     lower_bound=None,
@@ -208,9 +166,7 @@ def kda_chain_verify(
       conv_w: [W, 3, H, D] depthwise taps for q/k/v. conv_pool: [slots, W-1, 3, H, D] running
         conv history (row ``slot_idx[b]`` is request b's). ssm_pool: [slots, H, D, D].
       step_states: [R, T, H, D, D] / step_conv: [R, T, W-1, 3, H, D] verify scratch.
-      spec_step: optional [slots] int32 (lazy commit). None: scratch rows are batch rows
-        0..B-1 and the running state is the pool row. Given: scratch rows are **slots**, and a
-        slot with ``spec_step >= 0`` seeds from scratch step ``spec_step`` instead of the pool.
+        Scratch rows are batch rows 0..B-1; the running state is the pool row.
 
     Returns (o [B, T, H, D], updated step_states, updated step_conv).
     """
@@ -219,11 +175,9 @@ def kda_chain_verify(
     B, T, H, K = q.shape
     V = v.shape[-1]
     km1 = conv_pool.shape[1]
-    lazy = spec_step is not None
     assert conv_pool.shape[2:] == (3, H, K) and conv_w.shape == (km1 + 1, 3, H, K)
     assert step_states.shape[1:] == (T, H, K, V) and step_conv.shape[1:] == (T, km1, 3, H, K)
-    if not lazy:
-        assert step_states.shape[0] >= B and step_conv.shape[0] >= B
+    assert step_states.shape[0] >= B and step_conv.shape[0] >= B
     kw = dict(
         scale=float(scale),
         lower_bound=None if lower_bound is None else float(lower_bound),
@@ -246,25 +200,12 @@ def kda_chain_verify(
         pl.BlockSpec((1, km1, 3, H, K), slot(5)),  # pool conv history
         pl.BlockSpec((1, H, K, V), slot(4)),  # pool state
     ]
-    if lazy:
-        at_step = lambda nd: (lambda b, idx, st: (idx[b], jnp.maximum(st[b], 0)) + (0,) * (nd - 2))
-        in_specs += [
-            pl.BlockSpec((1, 1, H, K, V), at_step(5)),  # scratch state (aliased)
-            pl.BlockSpec((1, 1, km1, 3, H, K), at_step(6)),  # scratch conv window (aliased)
-        ]
-        rows = slot
-        kernel = _slot_rows_kernel
-        # Per-row seed step (gathered here: indexing the whole per-slot table by slot inside
-        # the index_map halted the TPU core).
-        prefetch = (slot_idx.astype(jnp.int32), spec_step[slot_idx].astype(jnp.int32))
-    else:
-        in_specs += [pl.BlockSpec(memory_space=pl.ANY), pl.BlockSpec(memory_space=pl.ANY)]
-        rows = lambda nd: (lambda b, *_: (b,) + (0,) * (nd - 1))
-        kernel = _batch_rows_kernel
-        prefetch = (slot_idx.astype(jnp.int32),)
+    in_specs += [pl.BlockSpec(memory_space=pl.ANY), pl.BlockSpec(memory_space=pl.ANY)]
+    rows = lambda nd: (lambda b, *_: (b,) + (0,) * (nd - 1))
+    prefetch = (slot_idx.astype(jnp.int32),)
     n_pre = len(prefetch)
     return pl.pallas_call(
-        functools.partial(kernel, **kw),
+        functools.partial(_batch_rows_kernel, **kw),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=n_pre,
             grid=(B,),
@@ -282,10 +223,7 @@ def kda_chain_verify(
         ],
         # operands: *prefetch, ascale, q, k, v, a, beta, dtb, conv_w, conv_pool, ssm_pool, st, stc
         input_output_aliases={n_pre + 10: 1, n_pre + 11: 2},
-        compiler_params=pltpu.CompilerParams(
-            # lazy: a slot's scratch is read (seed) and written in the same program
-            dimension_semantics=("arbitrary",) if lazy else ("parallel",)
-        ),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         interpret=interpret,
     )(
         *prefetch,

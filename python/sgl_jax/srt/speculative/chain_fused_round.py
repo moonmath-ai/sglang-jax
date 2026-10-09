@@ -410,7 +410,6 @@ def _fused_round(
             recurrent_axis=rsp.recurrent_partition_axis,
             conv_axis=rsp.conv_partition_axis,
             conv_tiled=getattr(rsp, "conv_tiled", False),
-            lazy_commit=getattr(rsp, "lazy_commit", False),
             **track,
         )
         tgt_updates = dict(tgt_updates)
