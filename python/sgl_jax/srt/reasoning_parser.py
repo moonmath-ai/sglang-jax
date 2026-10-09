@@ -294,8 +294,9 @@ class Gemma4Detector(BaseReasoningFormatDetector):
                 return StreamingParseResult()
 
         if not self._in_reasoning:
+            # Whole buffer: it includes any earlier chunk held back as a tag prefix ("<", "t").
             self._buffer = ""
-            return StreamingParseResult(normal_text=new_text)
+            return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult()
 

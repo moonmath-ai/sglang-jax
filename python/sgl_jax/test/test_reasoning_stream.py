@@ -64,8 +64,8 @@ PIECES = [
 ]
 
 
-def _stream(chunks):
-    p = ReasoningParser("glm45", stream_reasoning=True)
+def _stream(chunks, model_type="glm45"):
+    p = ReasoningParser(model_type, stream_reasoning=True)
     reasoning, normal = "", ""
     for c in chunks:
         r, n = p.parse_stream_chunk(c)
@@ -95,3 +95,32 @@ def test_stream_matches_non_stream(seed):
 def test_single_token_chunks():
     _, normal = _stream(PIECES)
     assert "</artifactId>" in normal and "</dependency>" in normal and "</p>" in normal
+
+
+# Gemma 4 holds back prefixes of "<|channel>thought\n", "thought\n" and "<channel|>",
+# so a chunk of exactly "<" or "t" after the reasoning ended must not be dropped.
+GEMMA4_PIECES = [
+    "<|channel>thought\n",
+    "plan",
+    "<channel|>",
+    "Here",
+    " <",
+    "b",
+    ">",
+    "t",
+    "x",
+    "</",
+    "b",
+    ">",
+    " t",
+    "<",
+    "/p>",
+]
+
+
+def test_gemma4_single_token_chunks():
+    text = "".join(GEMMA4_PIECES)
+    ref_reasoning, ref_normal = ReasoningParser("gemma4").parse_non_stream(text)
+    reasoning, normal = _stream(GEMMA4_PIECES, "gemma4")
+    assert normal.strip() == ref_normal.strip() == "Here <b>tx</b> t</p>"
+    assert reasoning.strip() == ref_reasoning.strip() == "plan"
