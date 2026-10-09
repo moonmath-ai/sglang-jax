@@ -281,6 +281,7 @@ suites = {
         TestFile("python/sgl_jax/test/test_moe_topk.py", 0.3),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 9),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v2_test.py", 3),
+        TestFile("python/sgl_jax/test/test_moe_gmm_prefill.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/biased_topk_test.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/grouped_topk_test.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_sampler.py", 0.5),
@@ -325,6 +326,12 @@ suites = {
         TestFile(
             "python/sgl_jax/test/configs/test_glm5_next_config.py",
             0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_short_conv.py",
+            0.3,
             runner="pytest",
             env={"JAX_PLATFORMS": "cpu"},
         ),
