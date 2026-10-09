@@ -214,6 +214,7 @@ class RecurrentStatePool:
         rec_spec = (recurrent_shape, self.temporal_dtype, self.recurrent_sharding)
         conv_specs = [(conv_shape, self.conv_dtype, self.conv_sharding)]
         if self.spec_num_draft_tokens > 0:
+            assert self.conv_tiled, "the speculative verify scratch needs the tiled conv layout"
             assert self.spec_rows is not None and self.spec_rows % self.dp_size == 0, (
                 self.spec_rows,
                 self.dp_size,
@@ -260,9 +261,12 @@ class RecurrentStatePool:
         return dict(
             mesh=self.mesh,
             data_axis=self.data_partition_axis,
-            recurrent_axis=self.recurrent_partition_axis,
-            conv_axis=self.conv_partition_axis,
-            conv_tiled=self.conv_tiled,
+            buffer_specs=(
+                self.recurrent_sharding.spec,
+                self.spec_recurrent_sharding.spec,
+                self.conv_sharding.spec,
+                self.spec_conv_sharding.spec,
+            ),
         )
 
     def commit_speculative_state(self, recurrent_indices, accept_lens) -> None:
@@ -455,9 +459,7 @@ class RecurrentStatePool:
     static_argnames=(
         "mesh",
         "data_axis",
-        "recurrent_axis",
-        "conv_axis",
-        "conv_tiled",
+        "buffer_specs",
     ),
     donate_argnums=(0, 1),
 )
@@ -469,9 +471,7 @@ def _commit_speculative_state(
     *,
     mesh,
     data_axis,
-    recurrent_axis,
-    conv_axis,
-    conv_tiled=False,
+    buffer_specs,
     track_indices=None,
     track_steps=None,
 ):
@@ -481,6 +481,7 @@ def _commit_speculative_state(
     ``track_indices`` / ``track_steps`` (extra-buffer radix cache): a row with
     ``track_steps[b] >= 0`` also snapshots ``spec_ssm[b, track_steps[b]]`` into its track slot
     ``track_indices[b]`` (the state at the track boundary its accepted prefix crossed).
+    ``buffer_specs``: partition specs of (ssm, verify ssm, conv, verify conv).
     """
     track = track_indices is not None
 
@@ -502,24 +503,13 @@ def _commit_speculative_state(
 
     row_args = (recurrent_indices, accept_lens) + ((track_indices, track_steps) if track else ())
     n_row_args = len(row_args)
+    ssm_spec, spec_ssm_spec, conv_spec, spec_conv_spec = buffer_specs
     commit_ssm = jax.shard_map(
         _select,
         mesh=mesh,
-        in_specs=(
-            P(data_axis, recurrent_axis, None, None),
-            P(data_axis, None, recurrent_axis, None, None),
-            *(P(data_axis),) * n_row_args,
-        ),
-        out_specs=P(data_axis, recurrent_axis, None, None),
+        in_specs=(ssm_spec, spec_ssm_spec, *(P(data_axis),) * n_row_args),
+        out_specs=ssm_spec,
         check_vma=False,
-    )
-    conv_spec = (
-        P(data_axis, None, None, conv_axis, None) if conv_tiled else P(data_axis, conv_axis, None)
-    )
-    spec_conv_spec = (
-        P(data_axis, None, None, None, conv_axis, None)
-        if conv_tiled
-        else P(data_axis, None, conv_axis, None)
     )
     commit_conv = jax.shard_map(
         _select,

@@ -328,6 +328,12 @@ suites = {
             env={"JAX_PLATFORMS": "cpu"},
         ),
         TestFile(
+            "python/sgl_jax/test/speculative/test_recurrent_spec_commit.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
             "test/srt/kernels/dsa/test_compute_topk_pages.py",
             0.1,
             runner="pytest",
