@@ -56,14 +56,6 @@ class MLAAttentionMetadata:
     page_indices: jax.Array = None
     seq_lens: jax.Array = None
     distribution: jax.Array = None
-    # Speculative chains only (TARGET_VERIFY / DRAFT_EXTEND): the same batch in request
-    # layout -- one sequence of T causal queries per request, fixed-stride page table --
-    # so per-query work that only reads the cache (the DSA indexer top-k) scans each
-    # request's context once instead of once per virtual sequence.
-    spec_req_seq_lens: jax.Array = None
-    spec_req_page_indices: jax.Array = None
-    spec_req_cu_q_lens: jax.Array = None
-    spec_req_distribution: jax.Array = None
 
     def tree_flatten(self):
         children = (
@@ -72,10 +64,6 @@ class MLAAttentionMetadata:
             self.page_indices,
             self.seq_lens,
             self.distribution,
-            self.spec_req_seq_lens,
-            self.spec_req_page_indices,
-            self.spec_req_cu_q_lens,
-            self.spec_req_distribution,
         )
         aux_data = {}
         return (children, aux_data)
@@ -83,17 +71,7 @@ class MLAAttentionMetadata:
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         obj = cls.__new__(cls)
-        (
-            obj.cu_q_lens,
-            obj.cu_kv_lens,
-            obj.page_indices,
-            obj.seq_lens,
-            obj.distribution,
-            obj.spec_req_seq_lens,
-            obj.spec_req_page_indices,
-            obj.spec_req_cu_q_lens,
-            obj.spec_req_distribution,
-        ) = children
+        obj.cu_q_lens, obj.cu_kv_lens, obj.page_indices, obj.seq_lens, obj.distribution = children
         return obj
 
 
@@ -236,13 +214,12 @@ class MLAAttentionBackend(AttentionBackend):
     # Speculative decoding (EAGLE / NEXTN, topk=1 chain)
     # ------------------------------------------------------------------
     #
-    # Every spec forward is expressed as a *decode* batch so the one-query-per-sequence
-    # kernels (MLA decode, DSA indexer top-k + page-level sparse MLA) apply unchanged:
+    # A speculative round is expressed in request layout: request r is one sequence whose
+    # page table sits at a fixed stride (``pages_per_seq``) in ``page_indices``.
     #
-    #   * TARGET_VERIFY / DRAFT_EXTEND: T tokens per request at KV slots S..S+T-1 become T
-    #     "virtual" sequences sharing the request's page table, virtual seq j having
-    #     kv_len = S + j + 1 (causal chain, the new token is the last KV slot).
-    #   * draft decode step i: one token per request with kv_len = seq_lens + i.
+    #   * TARGET_VERIFY / DRAFT_EXTEND: the request's T chain tokens are T causal queries at
+    #     KV slots S..S+T-1 (kv_len S+T), like a ragged extend.
+    #   * draft decode step i: one query per request with kv_len = seq_lens + i.
     #
     # ``S`` is the committed KV length: ``seq_lens`` after ``prepare_for_verify`` for
     # TARGET_VERIFY, ``seq_lens - (T - 1)`` after ``prepare_for_extend_after_verify`` for
@@ -270,85 +247,36 @@ class MLAAttentionBackend(AttentionBackend):
             base += aligned
         return pages, len(cache_loc) // self.page_size
 
-    def _region_layout_arrays(
-        self, slot_pages, virtual_slot: np.ndarray, n_valid: int, page_capacity: int
-    ) -> tuple[np.ndarray, ...]:
-        """Host ``(cu_q_lens, cu_kv_lens, page_indices, distribution)`` of a decode batch whose
-        virtual seq v maps to request ``virtual_slot[v]``'s *allocated* page region.
-
-        The layout depends only on allocations, not on lengths: the kernels use
-        ``cu_kv_lens[v]`` to locate a sequence's first page and take its length from
-        ``seq_lens``, so a region may extend past the live tokens. That keeps the layout
-        host-computable when lengths live on device (overlap schedule). Valid virtual seqs
-        (the first ``n_valid``) must form a prefix; padding seqs get empty regions.
-        """
-        num_seqs = len(virtual_slot)
-        n_pages = np.zeros(num_seqs, dtype=np.int64)
-        for v in range(n_valid):
-            n_pages[v] = len(slot_pages[virtual_slot[v]])
-        assert int(n_pages.sum()) <= page_capacity, (int(n_pages.sum()), page_capacity)
-        page_indices = np.zeros(page_capacity, dtype=np.int32)
-        off = 0
-        for v in range(n_valid):
-            n = int(n_pages[v])
-            page_indices[off : off + n] = slot_pages[virtual_slot[v]]
-            off += n
-        cu_kv_lens = np.zeros(num_seqs + 1, dtype=np.int32)
-        cu_kv_lens[1:] = np.cumsum(n_pages * self.page_size)
-        cu_q_lens = np.arange(num_seqs + 1, dtype=np.int32)
-        distribution = np.array([n_valid, n_valid, n_valid], dtype=np.int32)
-        return cu_q_lens, cu_kv_lens, page_indices, distribution
-
-    def metadata_from_arrays(self, arrays, *, upload: bool = True) -> MLAAttentionMetadata:
-        """Wrap ``(cu_q, cu_kv, page_indices, seq_lens, distribution)``, optionally followed by
-        the 4 ``spec_req_*`` request-layout arrays (host, or already on device)."""
-        if upload:
-            arrays = device_array(
-                tuple(arrays),
-                sharding=(NamedSharding(self.mesh, P(self.attention_data_partition_axis))),
-            )
-        return MLAAttentionMetadata(*arrays)
-
-    def spec_chain_layout(self, batch: ModelWorkerBatch, T: int) -> dict:
-        """Length-independent host layout of one speculative round (topk=1 chain of T).
-
-        Keys: ``valid`` [bs]; ``chain`` = (cu_q, cu_kv, pi, dist) for TARGET_VERIFY /
-        DRAFT_EXTEND over bs*T virtual sequences; ``req`` = (pi, cu_q, dist) request layout
-        (fixed stride, T causal queries per sequence); ``step`` = (cu_q, cu_kv, pi, dist) for
-        draft decode steps. Lengths are supplied separately (see ``spec_chain_lengths``).
-        """
+    def spec_chain_layout(self, batch: ModelWorkerBatch) -> dict:
+        """Length-independent host layout of one speculative round (topk=1 chain):
+        ``valid`` [bs] and ``page_indices`` [bs * pages_per_seq]. Lengths are applied by
+        :meth:`spec_metadata_arrays` (on host, or in-JIT when they live on device)."""
         slot_pages, total_pages = self._spec_request_pages(batch)
-        bs = len(batch.seq_lens)
         valid = np.asarray(batch.seq_lens) > 0
         n_valid = int(valid.sum())
-        assert np.all(valid[:n_valid]) and not np.any(
-            valid[n_valid:]
-        ), "valid rows must be a prefix"
-        chain = self._region_layout_arrays(
-            slot_pages, np.repeat(np.arange(bs), T), T * n_valid, T * total_pages
-        )
-        pages_per_seq = total_pages // bs  # == the chain layout's len(pi) // num_seqs
-        req_pi = np.zeros((bs, pages_per_seq), dtype=np.int32)
+        assert valid[:n_valid].all() and not valid[n_valid:].any(), "valid rows must be a prefix"
+        # Static stride: every request's pages must fit (max_pages_per_seq bounds the context
+        # plus the chain; without it, the whole batch's page capacity).
+        stride = getattr(self, "max_pages_per_seq", None) or total_pages
+        page_indices = np.zeros((len(valid), stride), dtype=np.int32)
         for r in range(n_valid):
-            pages = slot_pages[r][:pages_per_seq]
-            req_pi[r, : len(pages)] = pages
-        req = (
-            req_pi.reshape(-1),
-            (np.arange(bs + 1) * T).astype(np.int32),
-            np.array([0, 0, n_valid], dtype=np.int32),  # all "mixed": multi-query rows
-        )
-        step = self._region_layout_arrays(slot_pages, np.arange(bs), n_valid, total_pages)
-        return {"valid": valid, "chain": chain, "req": req, "step": step}
+            assert len(slot_pages[r]) <= stride, (len(slot_pages[r]), stride)
+            page_indices[r, : len(slot_pages[r])] = slot_pages[r]
+        return {"valid": valid, "page_indices": page_indices.reshape(-1)}
 
     @staticmethod
-    def spec_chain_lengths(committed, valid, T: int, xp=np):
-        """Lengths for a chain whose committed KV length is ``committed`` (= entry seq_lens - 1):
-        chain virtual seq j of request r attends committed[r] + j + 1 tokens; the request
-        layout holds committed[r] + T. ``xp`` is numpy on host or jax.numpy in-JIT."""
-        j = xp.arange(T, dtype=xp.int32)
-        chain = xp.where(valid[:, None], committed[:, None] + j[None, :] + 1, 0).reshape(-1)
-        req = xp.where(valid, committed + T, 0)
-        return chain.astype(xp.int32), req.astype(xp.int32)
+    def spec_metadata_arrays(page_indices, kv_lens, valid, T: int, page_size: int, xp=np):
+        """``(cu_q, cu_kv, page_indices, seq_lens, distribution)`` of a request-layout batch:
+        ``T`` causal queries per request ending at ``kv_lens`` (``T == 1``: decode). ``xp`` is
+        numpy on host or jax.numpy in-JIT."""
+        bs = valid.shape[0]
+        stride = page_indices.shape[0] // bs
+        rows = xp.arange(bs + 1, dtype=xp.int32)
+        n = xp.sum(valid).astype(xp.int32)
+        # Chains are multi-query ("mixed") rows; draft steps are decode rows.
+        dist = xp.stack([n, n, n] if T == 1 else [n * 0, n * 0, n])
+        seq_lens = xp.where(valid, kv_lens, 0).astype(xp.int32)
+        return rows * T, rows * (stride * page_size), page_indices, seq_lens, dist
 
     def eagle_forward_metadata_arrays(self, batch: ModelWorkerBatch):
         """Host arrays for TARGET_VERIFY / DRAFT_EXTEND (see get_eagle_forward_metadata)."""
@@ -362,34 +290,37 @@ class MLAAttentionBackend(AttentionBackend):
             committed = seq_lens - (T - 1)
         else:
             raise ValueError(f"Invalid speculative forward mode: {batch.forward_mode}")
-        layout = self.spec_chain_layout(batch, T)
-        cu_q, cu_kv, pi, dist = layout["chain"]
-        req_pi, req_cuq, req_dist = layout["req"]
-        chain_kv, req_seq = self.spec_chain_lengths(committed, layout["valid"], T)
-        return cu_q, cu_kv, pi, chain_kv, dist, req_seq, req_pi, req_cuq, req_dist
+        layout = self.spec_chain_layout(batch)
+        return self.spec_metadata_arrays(
+            layout["page_indices"], committed + T, layout["valid"], T, self.page_size
+        )
 
     def eagle_multi_step_metadata_arrays(self, batch: ModelWorkerBatch):
         """Host arrays per draft decode step i (kv_len = seq_lens + i)."""
         assert batch.forward_mode == ForwardMode.DECODE
         assert batch.speculative_eagle_topk == 1, "MLA speculative decoding requires topk == 1"
         seq_lens = np.asarray(batch.seq_lens, dtype=np.int64)
-        layout = self.spec_chain_layout(batch, 1)
-        cu_q, cu_kv, pi, dist = layout["step"]
-        valid = layout["valid"]
+        layout = self.spec_chain_layout(batch)
         return [
-            (cu_q, cu_kv, pi, np.where(valid, seq_lens + i, 0).astype(np.int32), dist)
+            self.spec_metadata_arrays(
+                layout["page_indices"], seq_lens + i, layout["valid"], 1, self.page_size
+            )
             for i in range(batch.speculative_num_steps)
         ]
+
+    def _upload_metadata(self, arrays) -> MLAAttentionMetadata:
+        sharding = NamedSharding(self.mesh, P(self.attention_data_partition_axis))
+        return MLAAttentionMetadata(*device_array(tuple(arrays), sharding=sharding))
 
     def get_eagle_forward_metadata(self, batch: ModelWorkerBatch, **kwargs):
         """Metadata for draft prefill (EXTEND), TARGET_VERIFY and DRAFT_EXTEND."""
         if batch.forward_mode == ForwardMode.EXTEND:
             return self.get_forward_metadata(batch)
-        return self.metadata_from_arrays(self.eagle_forward_metadata_arrays(batch))
+        return self._upload_metadata(self.eagle_forward_metadata_arrays(batch))
 
     def get_eagle_multi_step_metadata(self, batch: ModelWorkerBatch):
         """One decode metadata per draft step i: kv_len = seq_lens + i."""
-        return [self.metadata_from_arrays(a) for a in self.eagle_multi_step_metadata_arrays(batch)]
+        return [self._upload_metadata(a) for a in self.eagle_multi_step_metadata_arrays(batch)]
 
     def tree_flatten(self):
         children = (self.forward_metadata,)
@@ -564,9 +495,9 @@ class MLAAttentionBackend(AttentionBackend):
         # so metadata arrays fit in TPU scalar-prefetch memory.
         num_page_per_req = cdiv(max_context_len, page_size)
         res = 1024 * 1024 // 2 // num_page_per_req // 4
-        assert (
-            res > 0
-        ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
+        assert res > 0, (
+            f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
+        )
         return res
 
     def get_eagle_base_metadata(self, batch, **kwargs):

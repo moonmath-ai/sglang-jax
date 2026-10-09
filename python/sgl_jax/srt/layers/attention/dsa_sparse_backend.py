@@ -80,10 +80,6 @@ _INDEXER_KERNEL = os.environ.get("DSA_INDEXER_KERNEL", "0") == "1"
 # [T, max_kv] token scores in HBM — the dominant HLO-temporaries term at long
 # context. Same selection semantics as the ref (parity-gated). Default OFF.
 _INDEXER_KERNEL_PREFILL = os.environ.get("DSA_INDEXER_KERNEL_PREFILL", "0") == "1"
-# Speculative chains (TARGET_VERIFY / DRAFT_EXTEND): run sparse MLA as one causal
-# multi-query pass per request over the union of its chain tokens' hit pages instead of
-# one virtual sequence per token (which re-reads the request's pages per token).
-_CHAIN_REQUEST_MLA = os.environ.get("DSA_CHAIN_REQUEST_MLA", "1") == "1"
 # Speculative-chain sparse MLA KV block (pages); see _run_sparse_chain.
 _CHAIN_KV_PAGES_PER_BLOCK = 16
 
@@ -328,24 +324,12 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # pages to reuse and fell to dense too (a 6-layer dense O(T²) block).
         # The kv cache write still happens inside the dense kernel via
         # input_output_aliases in the remaining (no-indexer) dense case.
-        # Speculative chains (TARGET_VERIFY / DRAFT_EXTEND) arrive as decode metadata over one
-        # "virtual" sequence per token (MLAAttentionBackend.get_eagle_forward_metadata), so they
-        # take the decode path. The decode kernels write only their own query's KV slot, and
-        # virtual sequences of one request read each other's slots, so the whole chain's
-        # latent KV is written into the cache up front.
+        # Speculative chains (TARGET_VERIFY / DRAFT_EXTEND) arrive in request layout, T causal
+        # queries per request (MLAAttentionBackend.get_eagle_forward_metadata), and take the
+        # decode path: top-k per query, then one multi-query sparse MLA pass per request.
         mode = forward_batch.forward_mode
         is_spec_chain = mode.is_target_verify() or mode.is_draft_extend()
         is_decode = mode.is_decode() or is_spec_chain
-        # The request-level chain kernel (_run_sparse_chain) writes the chain's KV itself (one
-        # causal Tq-query pass per request); only the per-token virtual-sequence paths need it.
-        chain_kernel = (
-            is_spec_chain
-            and q_idx is not None
-            and (is_full or dsa_topk_pages_in is not None)
-            and self._uses_chain_kernel(md)
-        )
-        if is_spec_chain and not chain_kernel:
-            kv_cache = self._prewrite_chain_kv(new_kv_c, new_k_pe, kv_cache, dpa, md)
         if is_full and q_idx is None:
             o, kv_cache = self._run_dense(
                 q, q_rope, new_kv_c, new_k_pe, kv_cache, sm_scale, layer, dpa, md
@@ -360,6 +344,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 md,
                 compute_topk=is_decode,
                 compute_pages=is_decode,
+                chain=is_spec_chain,
             )
             return o, DSAFusedCache(kv=kv_cache, idx=idx_cache, topk=topk, topk_pages=topk_pages)
 
@@ -490,6 +475,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             md,
             compute_topk=not reuse_topk,
             compute_pages=not reuse_topk,
+            chain=is_spec_chain,
         )
         if not is_full or reuse_topk:
             assert (
@@ -502,6 +488,16 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             topk_pages_use = topk_pages
 
         # ── sparse MLA over top-k ─────────────────────────────────────────
+        if is_spec_chain:
+            o, kv_cache = self._run_sparse_chain(
+                q, q_rope, new_kv_c, new_k_pe, kv_cache, topk_pages_use, sm_scale, dpa, md
+            )
+            return o, DSAFusedCache(
+                kv=kv_cache,
+                idx=idx_cache,
+                topk=topk if is_full else None,
+                topk_pages=topk_pages if is_full else None,
+            )
         o, kv_cache = self._run_sparse(
             q, q_rope, new_kv_c, new_k_pe, kv_cache, topk_use, topk_pages_use, sm_scale, dpa, md
         )
@@ -528,6 +524,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         *,
         compute_topk=True,
         compute_pages=False,
+        chain=False,
     ):
         """On full layers: write k_idx into paged indexer cache, compute top-k
         (and, when ``compute_pages``, the unique-page list for IndexShare).
@@ -538,9 +535,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         if not is_full or q_idx is None:
             return idx_cache, None, None
 
-        # Speculative chain: request-layout view for the top-k scan (see MLAAttentionMetadata).
-        spec_req = md.spec_req_seq_lens is not None
-        if spec_req and self.index_kpool <= 1:
+        if chain and (self.index_kpool <= 1 or _PAGE_TOPK_BUDGET > 0):
             # Only GLM-5.3-Flash (KPool indexer) has a NextN draft on this backend.
             raise NotImplementedError("speculative chains need the KPool indexer")
         in_specs = (
@@ -553,10 +548,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             P(dpa),  # cu_q_lens
             P(dpa),  # cu_kv_lens
             P(dpa),  # distribution
-        ) + ((P(dpa),) * 4 if spec_req else ())
+        )
         out_specs = (P(dpa, None, None, None), P(dpa, None), P(dpa, None))
 
-        def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_, *req_):
+        def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_):
             if self.index_kpool > 1:
                 return self._kpool_index_local(
                     q_,
@@ -568,7 +563,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     cuq_,
                     cukv_,
                     dist_,
-                    req_,
+                    chain=chain,
                     compute_topk=compute_topk,
                     compute_pages=compute_pages,
                 )
@@ -653,16 +648,6 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             md.cu_q_lens,
             md.cu_kv_lens,
             md.distribution,
-            *(
-                (
-                    md.spec_req_seq_lens,
-                    md.spec_req_page_indices,
-                    md.spec_req_cu_q_lens,
-                    md.spec_req_distribution,
-                )
-                if spec_req
-                else ()
-            ),
         )
         return idx_cache, topk, (topk_pages if compute_pages else None)
 
@@ -682,8 +667,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         cuq_,
         cukv_,
         dist_,
-        req_,
         *,
+        chain,
         compute_topk,
         compute_pages,
     ):
@@ -720,21 +705,22 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 jnp.full((q_.shape[0], 1), -1, jnp.int32),
             )
         k_pools = self.index_topk // kp
-        if req_:
-            # Speculative chain: one causal multi-query pass per request (see _maybe_index).
-            req_seq, req_pi, _, _ = req_
-            n_req = req_seq.shape[0]
+        if chain:
+            # Speculative chain (request layout): one causal multi-query pass per request.
+            Tq = q_.shape[0] // seq_lens_.shape[0]
             pools = streamindex_topk_live_multiq(
                 q_,
                 w_,
                 blocks,
-                req_seq,
-                req_pi * bpp,
+                seq_lens_,
+                pi_ * bpp,
                 k=k_pools,
-                queries_per_seq=q_.shape[0] // n_req,
-                pages_per_seq=req_pi.shape[0] // n_req,
+                queries_per_seq=Tq,
+                pages_per_seq=pages_per_seq,
                 compression_ratio=kp,
             )
+            # Query j of request r sits at position seq_lens[r] - Tq + j.
+            q_pos = (seq_lens_[:, None] - Tq + jnp.arange(Tq)[None, :]).reshape(-1)
         else:
             pools = streamindex_topk_live(
                 q_,
@@ -749,20 +735,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 pages_per_seq=pages_per_seq,
                 compression_ratio=kp,
             )
-        # Decode metadata: query t is (virtual) sequence t, at position seq_lens[t] - 1.
-        topk = _kpool_expand(
-            pools, seq_lens_[: q_.shape[0]] - 1, kpool=kp, k_tokens=self.index_topk
-        )
-        mp = self._mask_pages(pages_per_seq)
-
-        def sorted_pages():
-            return compute_topk_pages(
-                topk,
-                page_size=self.page_size,
-                pages_per_seq=pages_per_seq,
-                k_pages_max=_TOPK_PAGES_WIDTH,
-            )
-
+            # Decode: query t is sequence t, at position seq_lens[t] - 1.
+            q_pos = seq_lens_[: q_.shape[0]] - 1
+        topk = _kpool_expand(pools, q_pos, kpool=kp, k_tokens=self.index_topk)
         if not compute_pages:
             topk_pages = jnp.full((topk.shape[0], 1), -1, jnp.int32)
         elif mp <= _TOPK_PAGES_WIDTH:
@@ -783,58 +758,6 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             topk_pages = sorted_pages()
         return cache_out, topk, topk_pages
 
-    def _prewrite_chain_kv(self, kvc, kpe, cache, dpa, md):
-        """Write token t's latent KV at slot ``seq_lens[t] - 1`` of virtual seq t.
-
-        Same value/layout the MLA v2 kernel writes in place: ``[kv_c | k_pe]`` each padded to
-        its 128-aligned width, packed ``kv_packing`` tokens per row of a page.
-        """
-
-        def _run(kvc_, kpe_, cache_, seq_lens_, pi_, cukv_):
-            n_pages, ps_per_pack, pack, dim = cache_.shape
-            page_size = ps_per_pack * pack
-            lkv = kvc_.shape[-1]
-            lkv_al = (lkv + 127) // 128 * 128
-            val = jnp.concatenate(
-                [
-                    jnp.pad(kvc_, ((0, 0), (0, lkv_al - lkv))),
-                    jnp.pad(kpe_, ((0, 0), (0, dim - lkv_al - kpe_.shape[-1]))),
-                ],
-                axis=-1,
-            ).astype(cache_.dtype)
-            T = kvc_.shape[0]
-            kv_len = seq_lens_[:T]
-            valid = kv_len > 0
-            pos = jnp.maximum(kv_len - 1, 0)
-            page = pi_[cukv_[:T] // page_size + pos // page_size]
-            off = pos % page_size
-            # Padding rows -> reserved page 0 (see _scatter_paged).
-            page = jnp.where(valid, page, 0)
-            off = jnp.where(valid, off, 0)
-            return cache_.at[page, off // pack, off % pack].set(val)
-
-        return jax.shard_map(
-            _run,
-            in_specs=(
-                P(dpa, None),
-                P(dpa, None),
-                P(dpa, None, None, None),
-                P(dpa),
-                P(dpa),
-                P(dpa),
-            ),
-            out_specs=P(dpa, None, None, None),
-            check_vma=False,
-        )(kvc, kpe, cache, md.seq_lens, md.page_indices, md.cu_kv_lens)
-
-    @staticmethod
-    def _uses_chain_kernel(md) -> bool:
-        return (
-            _CHAIN_REQUEST_MLA
-            and getattr(md, "spec_req_seq_lens", None) is not None
-            and _PAGE_TOPK_BUDGET == 0
-        )
-
     def _run_sparse(
         self,
         ql,
@@ -850,8 +773,6 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         page_share_group: int = 1,
         group_queries: bool = False,
     ):
-        if topk_pages is not None and self._uses_chain_kernel(md):
-            return self._run_sparse_chain(ql, qpe, kvc, kpe, cache, topk_pages, sm_scale, dpa, md)
         has_pages = topk_pages is not None
         if not has_pages:
             topk_pages = jnp.full((topk.shape[0], 1), -1, jnp.int32)
@@ -923,8 +844,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
 
     def _run_sparse_chain(self, ql, qpe, kvc, kpe, cache, topk_pages, sm_scale, dpa, md):
         """Speculative chain sparse MLA, one causal multi-query pass per request."""
-        n_req = md.spec_req_seq_lens.shape[0]
-        Tq = ql.shape[0] // n_req
+        Tq = ql.shape[0] // md.seq_lens.shape[0]
 
         def _run(ql_, qpe_, kvc_, kpe_, cache_, tpages_, req_seq_, req_pi_, req_dist_):
             page_size = cache_.shape[1] * cache_.shape[2]
@@ -975,9 +895,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             kpe,
             cache,
             topk_pages,
-            md.spec_req_seq_lens,
-            md.spec_req_page_indices,
-            md.spec_req_distribution,
+            md.seq_lens,
+            md.page_indices,
+            md.distribution,
         )
 
     def _maybe_index_prefill_pages(

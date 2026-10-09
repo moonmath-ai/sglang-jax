@@ -9,10 +9,9 @@ host overhead is several times the device time. This module runs a whole round i
     (greedy / target-only sampling) -> recurrent-state commit (hybrid targets)
     -> accepted-row gather -> draft DRAFT_EXTEND -> next round's top-1
 
-Every phase's attention metadata depends only on ``seq_lens`` / ``allocate_lens`` (the
-backends express each spec forward as a decode batch, see
-``MLAAttentionBackend.get_eagle_forward_metadata``), so it is built on the host up front and
-uploaded with one ``device_put``. Results come back with one ``device_get``. Outputs match the
+Every phase's attention metadata is one request-layout page table (host-built from
+``allocate_lens``, see ``MLAAttentionBackend.spec_chain_layout``) plus lengths derived in-JIT
+from ``seq_lens``, so the host uploads it once with one ``device_put``. Results come back with one ``device_get``. Outputs match the
 generic loop's ``GenerationBatchResult`` so the scheduler is unchanged.
 
 Scope: NEXTN / EAGLE with one draft model, topk == 1, num_draft_tokens == num_steps + 1,
@@ -82,9 +81,9 @@ def _is_dsa(backend) -> bool:
 
 
 def can_use_chain_fused_round(spec_worker) -> bool:
-    """NEXTN topk=1 chains on DSA targets. The DSA backend writes the chain's KV before verify
-    (virtual sequences of one request read each other's slots); the plain MLA backend does not,
-    and a draft with a reduced (hot-token) vocabulary would emit draft-vocab ids."""
+    """NEXTN topk=1 chains on DSA (KPool indexer) targets and drafts -- the only MLA-family
+    spec setup that exists today. A draft with a reduced (hot-token) vocabulary would emit
+    draft-vocab ids."""
     sa = spec_worker.server_args
     draft_runner = spec_worker.draft_worker.draft_model_runner
     return (
@@ -215,6 +214,7 @@ def _fused_round(
     mesh,
     use_relay,
     track_interval,
+    page_size,
     tgt_backend_def,
     dr_backend_def,
 ):
@@ -248,31 +248,19 @@ def _fused_round(
     is_greedy, use_top_p = I("is_greedy")[0] != 0, I("use_top_p")[0] != 0
     key = jax.random.fold_in(base_key, I("round_id")[0])
 
-    # Metadata: host-built, length-independent layout + lengths derived here from seq_lens
-    # (MLAAttentionBackend.spec_chain_layout / spec_chain_lengths).
+    # Metadata: the host-built request page table + lengths derived here from seq_lens
+    # (MLAAttentionBackend.spec_chain_layout / spec_metadata_arrays).
     verified_seq_lens = jnp.where(valid, seq_lens - 1, 0)
-    chain_kv, req_seq = MLAAttentionBackend.spec_chain_lengths(verified_seq_lens, valid, T, xp=jnp)
-    chain_md = MLAAttentionMetadata(
-        D(I("chain_cu_q")),
-        D(I("chain_cu_kv")),
-        D(I("chain_pi")),
-        D(chain_kv),
-        D(I("chain_dist")),
-        D(req_seq),
-        D(I("req_pi")),
-        D(I("req_cuq")),
-        D(I("req_dist")),
-    )
-    dr_step_mds = [
-        MLAAttentionMetadata(
-            D(I("step_cu_q")),
-            D(I("step_cu_kv")),
-            D(I("step_pi")),
-            D(jnp.where(valid, seq_lens + i, 0).astype(jnp.int32)),
-            D(I("step_dist")),
+    page_indices = I("page_indices")
+
+    def request_md(kv_lens, n_queries):
+        arrays = MLAAttentionBackend.spec_metadata_arrays(
+            page_indices, kv_lens, valid, n_queries, page_size, xp=jnp
         )
-        for i in range(steps - 1)
-    ]
+        return MLAAttentionMetadata(*(D(x) for x in arrays))
+
+    chain_md = request_md(verified_seq_lens + T, T)
+    dr_step_mds = [request_md(seq_lens + i, 1) for i in range(steps - 1)]
     dr_extend_md = chain_md
 
     tgt_backend = jax.tree_util.tree_unflatten(tgt_backend_def, [])
@@ -536,6 +524,7 @@ class ChainFusedRound:
                 "mesh",
                 "use_relay",
                 "track_interval",
+                "page_size",
             ),
             compiler_options=compiler_options,
         )
@@ -586,7 +575,7 @@ class ChainFusedRound:
         sel = np.asarray(mwb.logits_indices_selector)
         dr_mla = _mla_backend(dmr.attn_backend)
 
-        layout_arrays = dr_mla.spec_chain_layout(mwb, T)
+        layout_arrays = dr_mla.spec_chain_layout(mwb)
         valid = layout_arrays["valid"]
         recurrent_indices = mwb.recurrent_indices
         if recurrent_indices is None:
@@ -604,22 +593,9 @@ class ChainFusedRound:
         rep = NamedSharding(self.mesh, P())
         penalty = self._penalty(sampling_info, bs, rep)
         self._round_id += 1
-        cu_q, cu_kv, pi, dist = layout_arrays["chain"]
-        req_pi, req_cuq, req_dist = layout_arrays["req"]
-        s_cu_q, s_cu_kv, s_pi, s_dist = layout_arrays["step"]
         named_int = [
             ("valid", valid.astype(np.int32)),
-            ("chain_cu_q", cu_q),
-            ("chain_cu_kv", cu_kv),
-            ("chain_pi", pi),
-            ("chain_dist", dist),
-            ("req_pi", req_pi),
-            ("req_cuq", req_cuq),
-            ("req_dist", req_dist),
-            ("step_cu_q", s_cu_q),
-            ("step_cu_kv", s_cu_kv),
-            ("step_pi", s_pi),
-            ("step_dist", s_dist),
+            ("page_indices", layout_arrays["page_indices"]),
             ("recurrent_indices", np.asarray(recurrent_indices, np.int32)),
             ("top_ks", top_ks),
             ("temperatures", temperatures.view(np.int32)),
@@ -679,6 +655,7 @@ class ChainFusedRound:
                 mesh=self.mesh,
                 use_relay=overlap,
                 track_interval=self.track_interval,
+                page_size=dr_mla.page_size,
             )
         tmr.memory_pools.replace_all(tgt_updates)
         dmr.memory_pools.replace_all(dr_updates)
