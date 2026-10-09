@@ -540,6 +540,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
 
         # Speculative chain: request-layout view for the top-k scan (see MLAAttentionMetadata).
         spec_req = md.spec_req_seq_lens is not None
+        if spec_req and self.index_kpool <= 1:
+            # Only GLM-5.3-Flash (KPool indexer) has a NextN draft on this backend.
+            raise NotImplementedError("speculative chains need the KPool indexer")
         in_specs = (
             P(dpa, None, None),  # q_idx    [T, H_idx, D_idx] — replicated: softmax needs all heads
             P(dpa, None),  # k_idx    [T, D_idx]
@@ -574,40 +577,6 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
             cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
             cache3d = _scatter_paged(cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq)
-            if (
-                compute_topk
-                and req_
-                and cache3d.dtype == jnp.bfloat16
-                and idx_dim % 128 == 0
-                and page_size % 2 == 0
-                and _PAGE_TOPK_BUDGET == 0
-            ):
-                # One causal multi-query pass per request (T chain queries at the end of a
-                # seq_len S+T sequence): same token top-k as T one-query virtual sequences,
-                # reading each request's keys once.
-                req_seq, req_pi, _, _ = req_
-                n_req = req_seq.shape[0]
-                topk = streamindex_topk_live_multiq(
-                    q_,
-                    w_,
-                    cache3d,
-                    req_seq,
-                    req_pi,
-                    k=self.index_topk,
-                    queries_per_seq=q_.shape[0] // n_req,
-                    pages_per_seq=req_pi.shape[0] // n_req,
-                )
-                topk_pages = (
-                    compute_topk_pages(
-                        topk,
-                        page_size=self.page_size,
-                        pages_per_seq=pages_per_seq,
-                        k_pages_max=511,
-                    )
-                    if compute_pages
-                    else jnp.full((topk.shape[0], 1), -1, jnp.int32)
-                )
-                return cache3d.reshape(cache_.shape), topk, topk_pages
             if compute_topk and _PAGE_TOPK_BUDGET > 0:
                 # Page-scoring path: budget pages picked directly by max-pooled
                 # page score; token-level topk is not materialized (sparse MLA

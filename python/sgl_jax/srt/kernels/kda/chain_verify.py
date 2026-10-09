@@ -27,7 +27,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
-def _verify_body(
+def _verify_kernel(
+    idx_ref,
     ascale_ref,
     q_ref,
     k_ref,
@@ -36,8 +37,10 @@ def _verify_body(
     beta_ref,
     dtb_ref,
     convw_ref,
-    hist_tap,
-    h0_head,
+    hist_ref,
+    h0_ref,
+    st_in_ref,
+    stc_in_ref,
     o_ref,
     st_ref,
     stc_ref,
@@ -47,6 +50,9 @@ def _verify_body(
     x_dtype,
     g_dtype,
 ):
+    """One program per request: running state and conv history from the pool row; per-step
+    states and conv windows to scratch row = batch row."""
+    del idx_ref, st_in_ref, stc_in_ref  # idx drives the pool index_maps; scratch is aliased
     T, H = q_ref.shape[1], q_ref.shape[2]
     km1 = stc_ref.shape[2]
     f32 = jnp.float32
@@ -56,7 +62,7 @@ def _verify_body(
     def conv_steps(c, x_ref):
         """Post-conv [H, D] tiles of tensor c for every step (rounded like the XLA conv);
         writes the post-step window (last K-1 taps) of every step to the conv scratch."""
-        win = [hist_tap(j, c) for j in range(km1)] + [x_ref[0, t] for t in range(T)]
+        win = [hist_ref[0, j, c] for j in range(km1)] + [x_ref[0, t] for t in range(T)]
         w = [convw_ref[j, c].astype(f32) for j in range(km1 + 1)]
         ys = []
         for t in range(T):
@@ -87,7 +93,7 @@ def _verify_body(
         dT.append(jnp.transpose(jnp.exp(g)))
     outs = [[None] * H for _ in range(T)]
     for h in range(H):
-        S = h0_head(h).astype(f32)  # [D, V]
+        S = h0_ref[0, h].astype(f32)  # [D, V]
         for t in range(T):
             S = S * dT[t][:, h : h + 1]
             pred = jnp.sum(kT[t][:, h : h + 1] * S, axis=0, keepdims=True)  # [1, V]
@@ -98,46 +104,7 @@ def _verify_body(
         o_ref[0, t] = jnp.concatenate(outs[t], axis=0).astype(o_ref.dtype)
 
 
-def _batch_rows_kernel(
-    idx_ref,
-    ascale_ref,
-    q_ref,
-    k_ref,
-    v_ref,
-    a_ref,
-    beta_ref,
-    dtb_ref,
-    convw_ref,
-    hist_ref,
-    h0_ref,
-    st_in_ref,
-    stc_in_ref,
-    o_ref,
-    st_ref,
-    stc_ref,
-    **kw,
-):
-    """Running state in the pool; scratch rows are batch rows."""
-    del idx_ref, st_in_ref, stc_in_ref  # idx drives the pool index_maps; scratch is aliased
-    _verify_body(
-        ascale_ref,
-        q_ref,
-        k_ref,
-        v_ref,
-        a_ref,
-        beta_ref,
-        dtb_ref,
-        convw_ref,
-        lambda j, c: hist_ref[0, j, c],
-        lambda h: h0_ref[0, h],
-        o_ref,
-        st_ref,
-        stc_ref,
-        **kw,
-    )
-
-
-@functools.partial(jax.jit, static_argnames=("scale", "lower_bound", "g_dtype", "interpret"))
+@functools.partial(jax.jit, static_argnames=("scale", "lower_bound", "interpret"))
 def kda_chain_verify(
     q,
     k,
@@ -155,7 +122,6 @@ def kda_chain_verify(
     *,
     scale,
     lower_bound=None,
-    g_dtype=None,
     interpret=None,
 ):
     """Verify core on raw inputs (local shard).
@@ -182,9 +148,9 @@ def kda_chain_verify(
         scale=float(scale),
         lower_bound=None if lower_bound is None else float(lower_bound),
         x_dtype=q.dtype,
-        g_dtype=jnp.dtype(g_dtype or a.dtype),
+        g_dtype=jnp.dtype(a.dtype),
     )
-    # index_maps get (grid index, *scalar-prefetch refs); slot_idx is always the first ref.
+    # index_maps get (grid index, slot_idx) (slot_idx is the scalar-prefetch ref).
     tok = lambda b, *_: (b, 0, 0, 0)
     const = lambda nd: (lambda b, *_: (0,) * nd)
     slot = lambda nd: (lambda b, idx, *_: (idx[b],) + (0,) * (nd - 1))
@@ -202,12 +168,10 @@ def kda_chain_verify(
     ]
     in_specs += [pl.BlockSpec(memory_space=pl.ANY), pl.BlockSpec(memory_space=pl.ANY)]
     rows = lambda nd: (lambda b, *_: (b,) + (0,) * (nd - 1))
-    prefetch = (slot_idx.astype(jnp.int32),)
-    n_pre = len(prefetch)
     return pl.pallas_call(
-        functools.partial(_batch_rows_kernel, **kw),
+        functools.partial(_verify_kernel, **kw),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=n_pre,
+            num_scalar_prefetch=1,
             grid=(B,),
             in_specs=in_specs,
             out_specs=[
@@ -221,12 +185,12 @@ def kda_chain_verify(
             jax.ShapeDtypeStruct(step_states.shape, step_states.dtype),
             jax.ShapeDtypeStruct(step_conv.shape, step_conv.dtype),
         ],
-        # operands: *prefetch, ascale, q, k, v, a, beta, dtb, conv_w, conv_pool, ssm_pool, st, stc
-        input_output_aliases={n_pre + 10: 1, n_pre + 11: 2},
+        # operands: slot_idx, ascale, q, k, v, a, beta, dtb, conv_w, conv_pool, ssm_pool, st, stc
+        input_output_aliases={11: 1, 12: 2},
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         interpret=interpret,
     )(
-        *prefetch,
+        slot_idx.astype(jnp.int32),
         jnp.exp(a_log.astype(jnp.float32)).reshape(H, 1),
         q,
         k,

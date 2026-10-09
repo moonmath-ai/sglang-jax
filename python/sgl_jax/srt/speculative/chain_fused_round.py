@@ -34,6 +34,7 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.speculative.kernel import top_k_renorm_prob, top_p_renorm_prob
 from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
+from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSASparseAttentionBackend
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     HybridLinearAttnBackendMetadata,
@@ -73,16 +74,26 @@ def _mla_backend(backend):
     return backend if isinstance(backend, MLAAttentionBackend) else None
 
 
+def _is_dsa(backend) -> bool:
+    return isinstance(_mla_backend(backend), DSASparseAttentionBackend)
+
+
 def can_use_chain_fused_round(spec_worker) -> bool:
+    """NEXTN topk=1 chains on DSA targets. The DSA backend writes the chain's KV before verify
+    (virtual sequences of one request read each other's slots); the plain MLA backend does not,
+    and a draft with a reduced (hot-token) vocabulary would emit draft-vocab ids."""
     sa = spec_worker.server_args
+    draft_runner = spec_worker.draft_worker.draft_model_runner
     return (
-        spec_worker.topk == 1
+        spec_worker.speculative_algorithm.is_nextn()
+        and getattr(draft_runner.model, "hot_token_ids", None) is None
+        and spec_worker.topk == 1
         and spec_worker.speculative_num_steps > 1
         and spec_worker.speculative_num_draft_tokens == spec_worker.speculative_num_steps + 1
         and sa.dp_size == 1
         and not hasattr(spec_worker.draft_worker, "_workers")
-        and _mla_backend(spec_worker.target_worker.model_runner.attn_backend) is not None
-        and _mla_backend(spec_worker.draft_worker.draft_model_runner.attn_backend) is not None
+        and _is_dsa(spec_worker.target_worker.model_runner.attn_backend)
+        and _is_dsa(draft_runner.attn_backend)
     )
 
 
@@ -405,11 +416,7 @@ def _fused_round(
             rsp.conv_buffers,
             jax.sharding.reshard(recurrent_indices, data),
             jax.sharding.reshard(accept_length, data),
-            mesh=mesh,
-            data_axis=rsp.data_partition_axis,
-            recurrent_axis=rsp.recurrent_partition_axis,
-            conv_axis=rsp.conv_partition_axis,
-            conv_tiled=getattr(rsp, "conv_tiled", False),
+            **rsp.commit_static_args(),
             **track,
         )
         tgt_updates = dict(tgt_updates)

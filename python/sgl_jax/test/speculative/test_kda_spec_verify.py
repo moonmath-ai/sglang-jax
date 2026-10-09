@@ -23,10 +23,11 @@ from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 H, D, K, T = 2, 16, 4, 4
+TOL = 1e-5  # fp32 on CPU
 HIDDEN = H * D
 
 
-def _pool(mesh, spec_T, tiled=False, spec_rows=None):
+def _pool(mesh, spec_T, spec_rows=None):
     return RecurrentStatePool(
         linear_recurrent_layer_ids=[0],
         size=4,
@@ -37,7 +38,7 @@ def _pool(mesh, spec_T, tiled=False, spec_rows=None):
         temporal_dtype=jnp.float32,
         conv_dtype=jnp.float32,
         spec_num_draft_tokens=spec_T,
-        conv_tiled=tiled,
+        conv_tiled=True,
         spec_rows=spec_rows,
     )
 
@@ -83,7 +84,7 @@ class TestKDASpecVerify(unittest.TestCase):
 
     def _init(self, pool):
         extra = pool.conv_buffers[0][1:]
-        conv0 = jnp.asarray(_to_tiled(np.asarray(self.conv0))) if pool.conv_tiled else self.conv0
+        conv0 = jnp.asarray(_to_tiled(np.asarray(self.conv0)))
         pool.replace_buffer(([self.ssm0], [[conv0] + list(extra)]))
 
     def _meta(self, cu):
@@ -101,27 +102,20 @@ class TestKDASpecVerify(unittest.TestCase):
         pool.replace_buffer(([ssm], [conv_list]))
         return out
 
+    # The batch-row-indexed scratch only needs the verify batch, not one row per pool slot.
     def test_verify_matches_sequential_decode(self):
-        self._check(tiled=False)
+        self._check(spec_rows=self.bs)
 
-    def test_verify_matches_sequential_decode_tiled_conv(self):
-        self._check(tiled=True)
+    def test_verify_with_spare_scratch_rows(self):
+        self._check(spec_rows=self.bs + 3)
 
-    # Batch-row-indexed scratch only needs the verify batch, not one row per pool slot.
-    def test_verify_scratch_sized_by_batch_rows(self):
-        self._check(tiled=False, spec_rows=self.bs)
-
-    def test_verify_scratch_sized_by_batch_rows_tiled_conv(self):
-        self._check(tiled=True, spec_rows=self.bs)
-
-    def _check(self, tiled, spec_rows=None):
+    def _check(self, spec_rows):
         with jax.set_mesh(self.mesh):
             backend = KDAAttnBackend(mesh=self.mesh)
 
             # Reference: T sequential decode steps.
-            ref_pool = _pool(self.mesh, 0, tiled=tiled)  # DECODE through the tiled layout too
+            ref_pool = _pool(self.mesh, 0)  # DECODE through the tiled layout too
             self._init(ref_pool)
-            ref_conv_of = (lambda c: _to_legacy(c)) if tiled else (lambda c: np.asarray(c))
             backend.forward_metadata = self._meta(np.arange(self.bs + 1, dtype=np.int32))
             tok = lambda x, t: x.reshape(self.bs, T, *x.shape[1:])[:, t]
             ref_out, ref_ssm, ref_conv = [], [], []
@@ -135,25 +129,24 @@ class TestKDASpecVerify(unittest.TestCase):
                     )
                 )
                 ref_ssm.append(np.asarray(ref_pool.recurrent_buffers[0]))
-                ref_conv.append(ref_conv_of(ref_pool.conv_buffers[0][0]))
+                ref_conv.append(_to_legacy(ref_pool.conv_buffers[0][0]))
             ref_out = np.stack([np.asarray(o) for o in ref_out], axis=1).reshape(self.bs * T, -1)
 
             # Verify: one TARGET_VERIFY forward, running state untouched.
-            pool = _pool(self.mesh, T, tiled=tiled, spec_rows=spec_rows)
+            pool = _pool(self.mesh, T, spec_rows=spec_rows)
             self._init(pool)
-            conv_of = (lambda c: _to_legacy(c)) if tiled else (lambda c: np.asarray(c))
             backend.forward_metadata = self._meta(np.arange(self.bs + 1, dtype=np.int32) * T)
             out = self._run(
                 backend, pool, ForwardMode.TARGET_VERIFY, self.q, self.k, self.v, self.a, self.b
             )
             live = slice(0, 2 * T)  # padding row output is garbage by design
-            # fused kernel: bf16-rounded conv / q, k like XLA; on TPU XLA's default matmul
-            # precision also differs between the decode and verify reference paths.
-            tol = 2e-2 if tiled or jax.default_backend() == "tpu" else 1e-5
+            # On TPU XLA's default matmul precision differs between the decode reference and
+            # the fused verify kernel.
+            tol = 2e-2 if jax.default_backend() == "tpu" else TOL
             np.testing.assert_allclose(np.asarray(out)[live], ref_out[live], rtol=tol, atol=tol)
             ssm0, conv0 = np.asarray(self.ssm0), np.asarray(self.conv0)
             np.testing.assert_array_equal(np.asarray(pool.recurrent_buffers[0]), ssm0)
-            np.testing.assert_array_equal(conv_of(pool.conv_buffers[0][0]), conv0)
+            np.testing.assert_array_equal(_to_legacy(pool.conv_buffers[0][0]), conv0)
 
             # Commit: req0 accepted 3 tokens, req1 accepted 1; padding row (slot 0) ignored.
             accept = np.array([3, 1, 4], np.int32)
@@ -162,8 +155,8 @@ class TestKDASpecVerify(unittest.TestCase):
                 jax.device_put(self.indices, sh), jax.device_put(accept, sh)
             )
             ssm = np.asarray(pool.recurrent_buffers[0])
-            conv = conv_of(pool.conv_buffers[0][0])
-            stol = 2e-2 if tiled or jax.default_backend() == "tpu" else 1e-6
+            conv = _to_legacy(pool.conv_buffers[0][0])
+            stol = 2e-2 if jax.default_backend() == "tpu" else TOL
             for row, slot in enumerate(self.indices[:2]):
                 step = accept[row] - 1
                 np.testing.assert_allclose(ssm[slot], ref_ssm[step][slot], rtol=stol, atol=stol)

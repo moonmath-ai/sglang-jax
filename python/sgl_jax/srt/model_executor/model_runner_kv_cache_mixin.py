@@ -262,11 +262,8 @@ def _build_hybrid_pools(
     ), f"recurrent state_size ({state_size}) must be divisible by dp_size ({dp_size})."
 
     state_params = _linear_state_params_from_config(cfg)
-    # KDA models (KDAAttnBackend, equal q/k/v conv widths): lane-dense conv state layout.
-    conv_tiled = bool(getattr(cfg, "use_kda", False)) and (
-        state_params.num_k_heads in (None, state_params.num_heads)
-        and state_params.head_k_dim in (None, state_params.head_dim)
-    )
+    # KDA models (KDAAttnBackend): lane-dense conv state layout.
+    conv_tiled = bool(getattr(cfg, "use_kda", False))
     rsp = RecurrentStatePool(
         linear_recurrent_layer_ids=state_params.layers,
         size=state_size,
@@ -440,6 +437,18 @@ class ModelRunnerKVCacheMixin:
 
         return int(rest_memory)
 
+    def _spec_verify_tokens(self: ModelRunner) -> int:
+        """Draft tokens per request verified by this (target) model's recurrent layers, or 0.
+        Only KDA layers verify speculative chains, so other recurrent pools get no scratch."""
+        sa = self.server_args
+        if (
+            sa.speculative_algorithm is None
+            or self.is_draft_worker
+            or not getattr(self.linear_recurrent_config, "use_kda", False)
+        ):
+            return 0
+        return sa.speculative_num_draft_tokens
+
     def handle_recurrent_cache(self: ModelRunner, total_rest_memory: int) -> int:
         """Split HBM between recurrent state and KV cache.
 
@@ -490,6 +499,12 @@ class ModelRunnerKVCacheMixin:
             sa.max_recurrent_state_size = state_slots_per_rank * dp_size
 
         state_memory_per_rank = (sa.max_recurrent_state_size // dp_size) * per_req_state
+        # Speculative verify scratch (KDA targets): per verify-batch row, the state after each
+        # draft token (see RecurrentStatePool); rows = max running requests + 1 per rank.
+        spec_tokens = self._spec_verify_tokens()
+        if spec_tokens:
+            rows_per_rank = (sa.max_running_requests or sa.max_recurrent_state_size) // dp_size + 1
+            state_memory_per_rank += rows_per_rank * spec_tokens * per_req_state
         kv_budget = total_rest_memory - state_memory_per_rank
 
         logger.info(
@@ -881,12 +896,7 @@ class ModelRunnerKVCacheMixin:
                 state_size=state_size,
                 enable_recurrent_extra_buffer=self.server_args.enable_recurrent_extra_buffer,
                 ping_pong_slots=_recurrent_ping_pong_slots(self.server_args),
-                spec_num_draft_tokens=(
-                    self.server_args.speculative_num_draft_tokens
-                    if self.server_args.speculative_algorithm is not None
-                    and not self.is_draft_worker
-                    else 0
-                ),
+                spec_num_draft_tokens=self._spec_verify_tokens(),
             )
         else:
             self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)

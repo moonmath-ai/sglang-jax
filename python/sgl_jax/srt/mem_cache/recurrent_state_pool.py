@@ -102,12 +102,12 @@ class RecurrentStatePool:
         DP: each rank gets `size // dp_size` valid slots + 1 dummy slot at
         index 0, so total buffer slots = size + dp_size.
 
-        ``spec_num_draft_tokens > 0`` (speculative decoding, topk == 1 chain) adds per-slot
-        verify scratch to every layer: target verify writes the state after each of its
+        ``spec_num_draft_tokens > 0`` (speculative decoding, topk == 1 chain) adds verify
+        scratch to every layer: target verify writes the state after each of its
         ``spec_num_draft_tokens`` tokens there instead of advancing the running state, and
         :meth:`commit_speculative_state` then keeps the step matching the accepted length.
-        Scratch rows are *batch positions* of the verify batch (``total_slots`` rows bound
-        the verify batch size). It rides in the layer's conv list as
+        Scratch rows are *batch positions* of the verify batch (``spec_rows`` of them, global,
+        divisible by ``dp_size``). It rides in the layer's conv list as
         ``[conv, spec_conv [rows, T, proj, K-1], spec_ssm [rows, T, H, K, V]]`` so the model
         and backends pass it through untouched.
 
@@ -115,10 +115,6 @@ class RecurrentStatePool:
         ``[slots, K-1, 3, H, head_dim]`` (taps major, each tap a native [heads, 128] tile;
         spec_conv ``[rows, T, K-1, 3, H, head_dim]``) instead of ``[slots, proj, K-1]``, whose
         minor dim of K-1 forces relayouts around every use.
-
-        ``spec_rows`` (global, divisible by ``dp_size``) bounds the verify batch for the
-        batch-row-indexed scratch; it defaults to ``total_slots``. With the radix cache the pool
-        holds many snapshot slots, so size it by the max running requests instead.
         """
         state_dtype = recurrent_state_dtype()
         if temporal_dtype is None:
@@ -201,13 +197,6 @@ class RecurrentStatePool:
 
         self.recurrent_buffers, self.conv_buffers = self._create_buffers(abstract=abstract)
 
-    def _spec_scratch_rows(self) -> int:
-        """Rows of the batch-row-indexed verify scratch (the verify batch bound)."""
-        if self.spec_rows is None:
-            return self.total_slots
-        assert self.spec_rows % self.dp_size == 0, (self.spec_rows, self.dp_size)
-        return self.spec_rows
-
     def _create_buffers(self, *, abstract: bool = False) -> tuple[list, list]:
         recurrent_shape = (self.total_slots, self.num_heads, self.head_dim, self.head_dim)
         if self.conv_tiled:
@@ -220,78 +209,41 @@ class RecurrentStatePool:
             )
         else:
             conv_shape = (self.total_slots, self.proj_size, self.conv_kernel_size - 1)
-        temporal_dtype = self.temporal_dtype
-        conv_dtype = self.conv_dtype
+        # (shape, dtype, sharding) of the running state, then each layer's conv list:
+        # [conv] or [conv, spec_conv, spec_ssm] (speculative verify scratch).
+        rec_spec = (recurrent_shape, self.temporal_dtype, self.recurrent_sharding)
+        conv_specs = [(conv_shape, self.conv_dtype, self.conv_sharding)]
+        if self.spec_num_draft_tokens > 0:
+            assert self.spec_rows is not None and self.spec_rows % self.dp_size == 0, (
+                self.spec_rows,
+                self.dp_size,
+            )
+            rows_t = (self.spec_rows, self.spec_num_draft_tokens)
+            conv_specs += [
+                (rows_t + conv_shape[1:], self.conv_dtype, self.spec_conv_sharding),
+                (rows_t + recurrent_shape[1:], self.temporal_dtype, self.spec_recurrent_sharding),
+            ]
 
         if abstract:
-            conv_inner = [jax.ShapeDtypeStruct(conv_shape, conv_dtype, sharding=self.conv_sharding)]
-            if self.spec_num_draft_tokens > 0:
-                T = self.spec_num_draft_tokens
-                conv_inner += [
-                    jax.ShapeDtypeStruct(
-                        (self._spec_scratch_rows(), T) + conv_shape[1:],
-                        conv_dtype,
-                        sharding=self.spec_conv_sharding,
-                    ),
-                    jax.ShapeDtypeStruct(
-                        (self._spec_scratch_rows(), T) + recurrent_shape[1:],
-                        temporal_dtype,
-                        sharding=self.spec_recurrent_sharding,
-                    ),
-                ]
-            return (
-                [
-                    jax.ShapeDtypeStruct(
-                        recurrent_shape, temporal_dtype, sharding=self.recurrent_sharding
-                    )
-                    for _ in range(self.num_linear_recurrent_layers)
-                ],
-                [list(conv_inner) for _ in range(self.num_linear_recurrent_layers)],
+            make = lambda shape, dtype, sharding: jax.ShapeDtypeStruct(
+                shape, dtype, sharding=sharding
             )
-
-        alloc_recurrent = _get_recurrent_zero_allocator(
-            recurrent_shape, temporal_dtype, self.recurrent_sharding
-        )
-        alloc_conv = _get_recurrent_zero_allocator(conv_shape, conv_dtype, self.conv_sharding)
+        else:
+            make = lambda shape, dtype, sharding: _get_recurrent_zero_allocator(
+                shape, dtype, sharding
+            )()
         with jax.set_mesh(self.mesh):
-            recurrent_buffers = []
-            for _ in range(self.num_linear_recurrent_layers):
-                recurrent_buffers.append(alloc_recurrent())
-
-            conv_buffers = []
-            for _ in range(self.num_linear_recurrent_layers):
-                inner = []
-                inner.append(alloc_conv())
-                conv_buffers.append(inner)
-
-            if self.spec_num_draft_tokens > 0:
-                T = self.spec_num_draft_tokens
-                alloc_spec_conv = _get_recurrent_zero_allocator(
-                    (self._spec_scratch_rows(), T) + conv_shape[1:],
-                    conv_dtype,
-                    self.spec_conv_sharding,
-                )
-                alloc_spec_ssm = _get_recurrent_zero_allocator(
-                    (self._spec_scratch_rows(), T) + recurrent_shape[1:],
-                    temporal_dtype,
-                    self.spec_recurrent_sharding,
-                )
-                for inner in conv_buffers:
-                    inner.append(alloc_spec_conv())
-                    inner.append(alloc_spec_ssm())
-
+            recurrent_buffers = [make(*rec_spec) for _ in range(self.num_linear_recurrent_layers)]
+            conv_buffers = [
+                [make(*c) for c in conv_specs] for _ in range(self.num_linear_recurrent_layers)
+            ]
         return recurrent_buffers, conv_buffers
 
     @property
     def spec_conv_sharding(self):
-        if self.conv_tiled:
-            return NamedSharding(
-                self.mesh,
-                P(self.data_partition_axis, None, None, None, self.conv_partition_axis, None),
-            )
-        return NamedSharding(
-            self.mesh, P(self.data_partition_axis, None, self.conv_partition_axis, None)
-        )
+        # [rows, T, *conv dims]: the conv sharding with a replicated T axis after the rows.
+        spec = self.conv_sharding.spec
+        return NamedSharding(self.mesh, P(spec[0], None, *spec[1:]))
 
     @property
     def spec_recurrent_sharding(self):
@@ -301,12 +253,17 @@ class RecurrentStatePool:
         )
 
     def _inner_sharding(self, i: int):
-        return (
-            self.conv_sharding,
-            self.spec_conv_sharding,
-            self.spec_recurrent_sharding,
-            NamedSharding(self.mesh, P(self.data_partition_axis)),
-        )[i]
+        return (self.conv_sharding, self.spec_conv_sharding, self.spec_recurrent_sharding)[i]
+
+    def commit_static_args(self) -> dict:
+        """Static (mesh / layout) arguments of ``_commit_speculative_state`` for this pool."""
+        return dict(
+            mesh=self.mesh,
+            data_axis=self.data_partition_axis,
+            recurrent_axis=self.recurrent_partition_axis,
+            conv_axis=self.conv_partition_axis,
+            conv_tiled=self.conv_tiled,
+        )
 
     def commit_speculative_state(self, recurrent_indices, accept_lens) -> None:
         """After target verify: running state of each request := its verify state after
@@ -318,11 +275,7 @@ class RecurrentStatePool:
             self.conv_buffers,
             recurrent_indices,
             accept_lens,
-            mesh=self.mesh,
-            data_axis=self.data_partition_axis,
-            recurrent_axis=self.recurrent_partition_axis,
-            conv_axis=self.conv_partition_axis,
-            conv_tiled=self.conv_tiled,
+            **self.commit_static_args(),
         )
         self.recurrent_buffers = list(new_recurrent)
         self.conv_buffers = [list(inner) for inner in new_conv]

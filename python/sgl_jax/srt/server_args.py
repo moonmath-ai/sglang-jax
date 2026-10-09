@@ -543,18 +543,18 @@ class ServerArgs:
                         self.recurrent_track_interval,
                     )
             # Speculative rounds snapshot track boundaries only in the one-JIT chain round
-            # (chain_fused_round.py): NEXTN, topk=1 chains, MLA-family target at dp=1.
+            # (chain_fused_round.py): NEXTN, topk=1 chains, dsa_sparse target at dp=1.
             if self.speculative_algorithm is not None and not (
                 self.speculative_algorithm == "NEXTN"
                 and self.speculative_eagle_topk == 1
                 and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
-                and self.attention_backend in ("dsa_sparse", "mla")
+                and self.attention_backend == "dsa_sparse"
                 and self.dp_size == 1
             ):
                 raise ValueError(
                     "--enable-recurrent-extra-buffer supports speculative decoding only for "
                     "NEXTN with --speculative-eagle-topk=1, --speculative-num-draft-tokens == "
-                    "--speculative-num-steps + 1, a dsa_sparse/mla attention backend and dp=1; "
+                    "--speculative-num-steps + 1, the dsa_sparse attention backend and dp=1; "
                     f"got --speculative-algorithm={self.speculative_algorithm}."
                 )
             if self.enable_mixed_chunk:
@@ -2127,8 +2127,8 @@ class ServerArgs:
                 self.speculative_algorithm == "NEXTN"
                 and self.speculative_eagle_topk == 1
                 and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
-                # FA: draft_extend_fused; MLA-family (GLM-5.3 dsa_sparse): chain_fused_round
-                and self.attention_backend in ("fa", "dsa_sparse", "mla")
+                # FA: draft_extend_fused; dsa_sparse (GLM-5.3): chain_fused_round
+                and self.attention_backend in ("fa", "dsa_sparse")
                 and (self.attention_backend == "fa" or self.dp_size == 1)
             )
             supports_eagle3_overlap = (
@@ -2144,7 +2144,7 @@ class ServerArgs:
             if not (supports_nextn_overlap or supports_eagle3_overlap or supports_dflash_overlap):
                 raise ValueError(
                     "Speculative overlap scheduler only supports DFLASH/DSPARK, EAGLE3+FA, "
-                    "or NEXTN (fa, or dsa_sparse/mla at dp=1) with --speculative-eagle-topk=1 and "
+                    "or NEXTN (fa, or dsa_sparse at dp=1) with --speculative-eagle-topk=1 and "
                     "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
                     "Please pass --disable-overlap-schedule for other speculative configs."
                 )

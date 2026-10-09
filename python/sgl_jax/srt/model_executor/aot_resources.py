@@ -123,6 +123,8 @@ class AbstractResources(ModelRunnerKVCacheMixin):
                 conv_dtype=params.dtype.conv,
                 num_k_heads=params.num_k_heads,
                 head_k_dim=params.head_k_dim,
+                # Same conv layout as serving (_build_hybrid_pools): lane-dense for KDA.
+                conv_tiled=bool(getattr(self.linear_recurrent_config, "use_kda", False)),
                 abstract=True,
             )
         elif options.recurrent_capacity is not None:
