@@ -317,6 +317,17 @@ suites = {
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
         TestFile(
+            "python/sgl_jax/test/test_kda_chain_verify.py",
+            0.2,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_chain_fused_sampling.py",
+            0.1,
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
             "test/srt/kernels/dsa/test_compute_topk_pages.py",
             0.1,
             runner="pytest",
