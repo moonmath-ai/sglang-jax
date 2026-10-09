@@ -1,4 +1,5 @@
-"""GLM-5.3-Flash end-to-end: accuracy (gsm8k) and long-context retrieval (needle).
+"""GLM-5.3-Flash end-to-end: accuracy (gsm8k) and long-context retrieval (needle), without
+and with NextN MTP speculative decoding.
 
 Needs a TPU v7x-8 (tp8/ep8) and the zai-org/GLM-5.3-Flash weights, so it is gated:
 
@@ -135,6 +136,69 @@ class GLM53FlashMixin:
 )
 class TestGLM53Flash(GLM53FlashMixin, CustomTestCase):
     pass
+
+
+@unittest.skipUnless(
+    os.getenv("SGLANG_GLM53_FLASH_E2E") == "1",
+    "needs a TPU v7x-8 with the GLM-5.3-Flash weights; set SGLANG_GLM53_FLASH_E2E=1",
+)
+class TestGLM53FlashNextN(GLM53FlashMixin, CustomTestCase):
+    """NextN MTP (one-JIT chain round over DSA + KDA) with the overlap schedule and the
+    recurrent radix cache. Adds draft quality (mean accept length) and token-level agreement
+    with the target's own greedy choice to the base checks."""
+
+    EXTRA_ARGS = [
+        "--speculative-algorithm",
+        "NEXTN",
+        "--speculative-draft-model-path",
+        MODEL,
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+    ]
+
+    def test_a_gsm8k(self):
+        super().test_a_gsm8k()
+        info = requests.get(f"{self.base_url}/get_server_info", timeout=30).json()
+        # Measured ~3.6-3.7 (of 4).
+        self.assertGreaterEqual(info["internal_states"][0]["avg_spec_accept_length"], 3.3)
+
+    def test_b_teacher_forced_greedy(self):
+        """Every token a spec round emits should be the target's own greedy next token
+        (one-token prefill of the same prefix). The two paths differ numerically, so a few
+        near-tie flips are expected (measured 1-2 of 72)."""
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(self.model, trust_remote_code=True)
+        questions = [
+            "A robe takes 2 bolts of blue fiber and half that much white fiber. "
+            "How many bolts in total does it take?",
+            "Janet has 3 apples and buys 5 more. She gives away 2. How many apples does she have?",
+            "Write one sentence about the history of the Roman Empire.",
+        ]
+        greedy = {"temperature": 0}
+        total = mismatches = 0
+        for q in questions:
+            ids = tok.encode(
+                tok.apply_chat_template(
+                    [{"role": "user", "content": q}], add_generation_prompt=True, tokenize=False
+                ),
+                add_special_tokens=False,
+            )
+            out = self._post(
+                "/generate", {"input_ids": ids, "sampling_params": greedy | {"max_new_tokens": 24}}
+            )["output_ids"]
+            for k, token in enumerate(out):
+                ref = self._post(
+                    "/generate",
+                    {"input_ids": ids + out[:k], "sampling_params": greedy | {"max_new_tokens": 1}},
+                )["output_ids"][0]
+                total += 1
+                mismatches += ref != token
+        self.assertLessEqual(mismatches, 4, f"{mismatches}/{total} teacher-forced mismatches")
 
 
 if __name__ == "__main__":
