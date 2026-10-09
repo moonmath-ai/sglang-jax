@@ -74,7 +74,7 @@ def streamindex_topk_live(
 
     Rows are bucketed by their live context (powers of two pages), so work and the exit-stage
     top-k stay bounded by the live context rather than the page-table capacity: either one
-    pass at the batch's longest bucket, or (few active rows, or DSA_INDEXER_SINGLE_PASS=0)
+    pass at the batch's longest bucket (chains, and decode with more than four active rows), or
     same-bucket groups of up to four. Do not vmap the bucket switch: that would evaluate every
     bucket and restore full-capacity work.
 
@@ -220,10 +220,10 @@ def streamindex_topk_live(
         _, out = jax.lax.while_loop(condition, group_step, (jnp.asarray(0, jnp.int32), out))
         return out[:batch].reshape(batch * Tq, k)
 
-    if not _SINGLE_PASS:
-        return _grouped()
     if not decode:
         return _single_pass()
+    if batch <= _SINGLE_PASS_MIN_ROWS:
+        return _grouped()
     # The single pass scores every (padded) decode row at the bucket of the longest live
     # context, so with few active rows the grouped loop, which scores only active rows, is
     # cheaper (e.g. one long request in a bs-16 decode bucket).

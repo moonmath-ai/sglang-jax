@@ -704,6 +704,16 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         )
         q_pos = (seq_lens_[:, None] - Tq + jnp.arange(Tq)[None, :]).reshape(-1)
         topk = _kpool_expand(pools, q_pos, kpool=kp, k_tokens=self.index_topk)
+        mp = self._mask_pages(pages_per_seq)
+
+        def sorted_pages():
+            return compute_topk_pages(
+                topk,
+                page_size=self.page_size,
+                pages_per_seq=pages_per_seq,
+                k_pages_max=_TOPK_PAGES_WIDTH,
+            )
+
         if not compute_pages:
             topk_pages = jnp.full((topk.shape[0], 1), -1, jnp.int32)
         elif mp <= _TOPK_PAGES_WIDTH:
