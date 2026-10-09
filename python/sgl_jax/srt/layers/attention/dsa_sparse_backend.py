@@ -40,10 +40,7 @@ from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
     prefill_write_and_attend_ragged_qblock,
     prefill_write_and_attend_ragged_qblock_tsa,
 )
-from sgl_jax.srt.kernels.dsa.streamindex_live import (
-    streamindex_topk_live,
-    streamindex_topk_live_multiq,
-)
+from sgl_jax.srt.kernels.dsa.streamindex_live import streamindex_topk_live
 from sgl_jax.srt.kernels.dsa.streamindex_topk import (
     streamindex_page_topk,
     streamindex_topk,
@@ -708,16 +705,19 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         if chain:
             # Speculative chain (request layout): one causal multi-query pass per request.
             Tq = q_.shape[0] // seq_lens_.shape[0]
-            pools = streamindex_topk_live_multiq(
+            pools = streamindex_topk_live(
                 q_,
                 w_,
                 blocks,
                 seq_lens_,
                 pi_ * bpp,
+                cuq_,
+                cukv_,
+                dist_,
                 k=k_pools,
-                queries_per_seq=Tq,
                 pages_per_seq=pages_per_seq,
                 compression_ratio=kp,
+                queries_per_seq=Tq,
             )
             # Query j of request r sits at position seq_lens[r] - Tq + j.
             q_pos = (seq_lens_[:, None] - Tq + jnp.arange(Tq)[None, :]).reshape(-1)
