@@ -200,6 +200,32 @@ class TestGLM53FlashNextN(GLM53FlashMixin, CustomTestCase):
                 mismatches += ref != token
         self.assertLessEqual(mismatches, 4, f"{mismatches}/{total} teacher-forced mismatches")
 
+    def test_d_prefix_reuse_across_track_boundary(self):
+        """Radix reuse of recurrent state snapshotted during spec decode. A ~3.9K-token prompt
+        decodes past the 4096-token track boundary (the default interval is the chunked
+        prefill size), so the round snapshots the KDA state there. A second request that
+        extends the first one's output must hit the cache past the boundary and continue
+        with the same greedy tokens; a missing or stale snapshot breaks it."""
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(self.model, trust_remote_code=True)
+        text = " ".join(f"Item {i} is filed under shelf {i % 37}." for i in range(800))
+        ids = tok.encode(text, add_special_tokens=False)[:3900]
+        greedy = {"temperature": 0, "ignore_eos": True}
+        out = self._post(
+            "/generate", {"input_ids": ids, "sampling_params": greedy | {"max_new_tokens": 320}}
+        )["output_ids"]
+        self.assertEqual(len(out), 320)
+        mismatches = 0
+        for k in range(260, 300, 5):  # prefixes of 4160-4195 tokens, past the boundary
+            r = self._post(
+                "/generate",
+                {"input_ids": ids + out[:k], "sampling_params": greedy | {"max_new_tokens": 1}},
+            )
+            self.assertGreaterEqual(r["meta_info"]["cached_tokens"], 4096, "no radix hit")
+            mismatches += r["output_ids"][0] != out[k]
+        self.assertLessEqual(mismatches, 2, f"{mismatches}/8 continuations differ after reuse")
+
 
 if __name__ == "__main__":
     unittest.main()

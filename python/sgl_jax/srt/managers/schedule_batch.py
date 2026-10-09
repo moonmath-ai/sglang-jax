@@ -1880,7 +1880,6 @@ class ScheduleBatch:
                             ],
                             dtype=np.int32,
                         )
-                        info.recurrent_track_mask = np.ones(len(info.reqs), dtype=np.int32)
             return
 
         # Process each DP rank
@@ -2939,6 +2938,19 @@ class ScheduleBatch:
             )
             model_worker_batch.recurrent_indices = recurrent_indices
             model_worker_batch.has_initial_state = np.ones(total_bs, dtype=np.bool_)
+            # Extra-buffer radix cache: each request's next track slot (prepare_for_decode),
+            # which the round snapshots into when the accepted prefix crosses a boundary.
+            tracks = [
+                info.recurrent_track_indices
+                for info in self.reqs_info
+                if info.recurrent_track_indices is not None
+            ]
+            if tracks:
+                track_indices = np.zeros(total_bs, dtype=np.int32)
+                track_indices[sel] = np.concatenate(tracks)
+                model_worker_batch.recurrent_track_indices = track_indices
+            for info in self.reqs_info:
+                info.recurrent_track_indices = None
         return model_worker_batch
 
     @staticmethod
