@@ -1,7 +1,5 @@
 """Fused Expert-Parallel MoE layer using Pallas kernel."""
 
-import os
-
 import jax
 from flax import nnx
 from jax import numpy as jnp
@@ -560,8 +558,6 @@ class FusedEPMoE(nnx.Module):
 
 # Token count at/above which FusedEPMoEV2 runs the grouped-matmul path (moe_gmm_prefill.py).
 _GMM_MIN_TOKENS = 1024
-# SGL_JAX_MOE_GMM_PREFILL=0 keeps prefill-sized batches on the fused kernel.
-_GMM_PREFILL = os.environ.get("SGL_JAX_MOE_GMM_PREFILL", "1") == "1"
 
 
 class FusedEPMoEV2(FusedEPMoE):
@@ -569,7 +565,15 @@ class FusedEPMoEV2(FusedEPMoE):
 
     Inherits weight init and quantization from FusedEPMoE. Overrides __call__
     to dispatch to fused_ep_moe_v2 with v2-specific flags.
+
+    ``gmm_prefill``: route batches of at least ``_GMM_MIN_TOKENS`` tokens with block-FP8
+    weights to the grouped-matmul path (moe_gmm_prefill.py) instead of the fused kernel.
+    Opt-in per model: only benchmarked on GLM-5.3-Flash.
     """
+
+    def __init__(self, *args, gmm_prefill: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gmm_prefill = gmm_prefill
 
     def __call__(
         self,
@@ -590,10 +594,10 @@ class FusedEPMoEV2(FusedEPMoE):
         assert hidden_states.ndim == 2
 
         if (
-            _GMM_PREFILL
+            self.gmm_prefill
             and hidden_states.shape[0] >= _GMM_MIN_TOKENS
             and self.w1_scale is not None
-            and getattr(self, "quant_block_k", None) is not None
+            and self.quant_block_k is not None
         ):
             # Large (prefill) batches: grouped-matmul EP path on the same weights (the fused
             # kernel is tuned for decode-sized batches; ~3.4x slower at 4096 tokens).
@@ -620,6 +624,7 @@ class FusedEPMoEV2(FusedEPMoE):
                 val(self.w3_shared_scale),
                 val(self.w2_shared_scale),
                 top_k=self.num_experts_per_tok,
+                activation=self.activation,
                 swiglu_limit=swiglu_limit,
                 shared_swiglu_limit=shared_swiglu_limit,
                 act_quant=self.activation_quantized_dtype is not None

@@ -8,8 +8,8 @@ experts (SparseCore ragged gather), runs the three expert matmuls with ``gmm`` (
 selects the local experts), combines its rows back into token order, adds its slice of the
 shared expert, and a psum over the mesh sums the partial outputs.
 
-Numerics follow ``fused_moe.v2.kernel.ref_moe``: SiLU gate clamped at ``swiglu_limit`` (single
-sided), up branch clamped to +-limit; FP8 activations quantized per token when ``act_quant``.
+Numerics follow ``fused_moe.v2.kernel.ref_moe``: ``activation`` gate clamped at ``swiglu_limit``
+(single sided), up branch clamped to +-limit; FP8 activations quantized per token when ``act_quant``.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from sgl_jax.srt.kernels.sparse_core.moe_permute import sc_combine, sc_dispatch_
 _AXES = ("data", "tensor")
 
 
-def _shared_expert(x, w1, w3, w2, s1, s3, s2, limit, out_dtype):
+def _shared_expert(x, w1, w3, w2, s1, s3, s2, activation, limit, out_dtype):
     def deq(w, s):
         w = w.astype(jnp.bfloat16)
         return w if s is None else (w.astype(jnp.float32) * s.reshape(1, -1)).astype(jnp.bfloat16)
@@ -33,7 +33,7 @@ def _shared_expert(x, w1, w3, w2, s1, s3, s2, limit, out_dtype):
     f32 = jnp.float32
     gate = jnp.dot(x, deq(w1, s1), preferred_element_type=f32)
     up = jnp.dot(x, deq(w3, s3), preferred_element_type=f32)
-    act = activation_fn(gate, up, "silu", limit).astype(jnp.bfloat16)
+    act = activation_fn(gate, up, activation, limit).astype(jnp.bfloat16)
     return jnp.dot(act, deq(w2, s2), preferred_element_type=f32).astype(out_dtype)
 
 
@@ -56,6 +56,7 @@ def gmm_prefill_moe(
     w2_shared_scale=None,
     *,
     top_k: int,
+    activation: str = "silu",
     swiglu_limit: float | None,
     shared_swiglu_limit: float | None,
     act_quant: bool,
@@ -99,7 +100,7 @@ def gmm_prefill_moe(
         gate = gmm(xs, w1_, rhs_scale=s1, zero_initialize=False, **kw)
         up = gmm(xs, w3_, rhs_scale=s3, zero_initialize=False, **kw)
         act = activation_fn(
-            gate.astype(jnp.float32), up.astype(jnp.float32), "silu", swiglu_limit
+            gate.astype(jnp.float32), up.astype(jnp.float32), activation, swiglu_limit
         ).astype(out_dtype)
         y = gmm(act, w2_, rhs_scale=s2, zero_initialize=True, **kw)  # non-local rows = 0
 
@@ -113,12 +114,14 @@ def gmm_prefill_moe(
                 rows = T // n_shards
                 xr = jax.lax.dynamic_slice_in_dim(x, d * rows, rows, axis=0)
                 se = _shared_expert(
-                    xr, w1s, w3s, w2s, s1s, s3s, s2s, shared_swiglu_limit, out_dtype
+                    xr, w1s, w3s, w2s, s1s, s3s, s2s, activation, shared_swiglu_limit, out_dtype
                 )
                 cur = jax.lax.dynamic_slice_in_dim(out, d * rows, rows, axis=0)
                 out = jax.lax.dynamic_update_slice_in_dim(out, cur + se, d * rows, axis=0)
             else:
-                se = _shared_expert(x, w1s, w3s, w2s, s1s, s3s, s2s, shared_swiglu_limit, out_dtype)
+                se = _shared_expert(
+                    x, w1s, w3s, w2s, s1s, s3s, s2s, activation, shared_swiglu_limit, out_dtype
+                )
                 out = out + jnp.where(d == 0, se, jnp.zeros_like(se))
         if scatter_tokens:
             return jax.lax.psum_scatter(out, _AXES, scatter_dimension=0, tiled=True)
@@ -155,18 +158,10 @@ def gmm_prefill_moe(
         *(exp(a) for a in args[3:9]),
         *(None if a is None else rep(a) for a in args[9:]),
     )
-    present = [i for i, a in enumerate(args) if a is not None]  # shard_map takes no None leaves
-
-    def _bound(*vals):
-        full = [None] * len(args)
-        for i, v in zip(present, vals):
-            full[i] = v
-        return _local(*full)
-
     return jax.shard_map(
-        _bound,
+        _local,
         mesh=mesh,
-        in_specs=tuple(specs[i] for i in present),
+        in_specs=specs,
         out_specs=P(_AXES, None) if scatter_tokens else P(None, None),
         check_vma=False,
-    )(*[args[i] for i in present])
+    )(*args)

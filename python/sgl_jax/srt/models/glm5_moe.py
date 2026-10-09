@@ -111,10 +111,12 @@ def moe_router(config, mesh, layer_id: int) -> tuple[GateLogit, TopK]:
     return gate, topk
 
 
-def fused_v2_moe(config, mesh, layer_id: int, dtype, num_shared_experts: int) -> FusedEPMoEV2:
+def fused_v2_moe(
+    config, mesh, layer_id: int, dtype, num_shared_experts: int, *, gmm_prefill: bool = False
+) -> FusedEPMoEV2:
     """Routed (+ in-kernel shared) experts on the fused v2 kernel. A block-FP8 checkpoint's
     shared-expert scales get block-scale params, requantized per channel at load
-    (Glm5ForCausalLM.prepare_weight_loading)."""
+    (Glm5ForCausalLM.prepare_weight_loading). ``gmm_prefill``: see FusedEPMoEV2."""
     quant_config = getattr(config, "quantization_config", None)
     n_group = getattr(config, "n_group", 1)
     mlp = FusedEPMoEV2(
@@ -135,6 +137,7 @@ def fused_v2_moe(config, mesh, layer_id: int, dtype, num_shared_experts: int) ->
         num_shared_experts=num_shared_experts,
         moe_shared_expert_intermediate_size=config.moe_intermediate_size,
         quantization_config=quant_config,
+        gmm_prefill=gmm_prefill,
     )
     block_size = getattr(quant_config, "weight_block_size", None)
     if (

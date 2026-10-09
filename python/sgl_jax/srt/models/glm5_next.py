@@ -246,7 +246,9 @@ class Glm5NextDecoderLayer(nnx.Module):
     def _build_moe(self, config: Glm5NextConfig, mesh, layer_id: int, dtype) -> None:
         """Routed + shared experts on the fused v2 kernel, the only one with the swiglu clamp."""
         self.moe_gate, self.topk = moe_router(config, mesh, layer_id)
-        self.mlp = fused_v2_moe(config, mesh, layer_id, dtype, config.n_shared_experts)
+        self.mlp = fused_v2_moe(
+            config, mesh, layer_id, dtype, config.n_shared_experts, gmm_prefill=True
+        )
 
     def __call__(
         self,

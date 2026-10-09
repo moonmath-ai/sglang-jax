@@ -15,7 +15,8 @@ E, H, INTER, IS, T, K, QB, LIMIT = 16, 512, 256, 256, 64, 4, 128, 10.0
 
 @pytest.mark.parametrize("act_quant,tol", [(False, 1e-2), (True, 3e-2)])
 @pytest.mark.parametrize("scatter", [False, True])
-def test_gmm_prefill_moe_matches_reference(act_quant, tol, scatter):
+@pytest.mark.parametrize("shared", [True, False])
+def test_gmm_prefill_moe_matches_reference(act_quant, tol, scatter, shared):
     n = max(d for d in (8, 4, 2, 1) if d <= len(jax.devices()) and E % d == 0)
     mesh = jax.make_mesh((1, n), ("data", "tensor"), devices=jax.devices()[:n])
     exp = lambda nd: NamedSharding(mesh, P(("data", "tensor"), *([None] * (nd - 1))))
@@ -30,6 +31,9 @@ def test_gmm_prefill_moe_matches_reference(act_quant, tol, scatter):
     x = jnp.asarray(rng.normal(0, 1, (T, H)), jnp.bfloat16)
     ids = jnp.asarray(np.argsort(-rng.normal(size=(T, E)), axis=1)[:, :K], jnp.int32)
     tw = jnp.asarray(rng.uniform(0.05, 0.3, (T, K)), jnp.float32)
+    if not shared:  # None args reach shard_map with None specs
+        w1s = w3s = w2s = s1s = s3s = s2s = None
+    shared_scale = lambda s: None if s is None else s[:, 0, :]
 
     ref = ref_moe(
         x,
@@ -45,15 +49,15 @@ def test_gmm_prefill_moe_matches_reference(act_quant, tol, scatter):
         w1_shared=w1s,
         w2_shared=w2s,
         w3_shared=w3s,
-        w1_shared_scale=s1s[:, 0, :],
-        w2_shared_scale=s2s[:, 0, :],
-        w3_shared_scale=s3s[:, 0, :],
+        w1_shared_scale=shared_scale(s1s),
+        w2_shared_scale=shared_scale(s2s),
+        w3_shared_scale=shared_scale(s3s),
         quant_block_k=QB,
         w1_scale=s1,
         w2_scale=s2,
         w3_scale=s3,
     )
-    put = jax.device_put
+    put = lambda a, s: None if a is None else jax.device_put(a, s)
     out = jax.jit(
         lambda *a: gmm_prefill_moe(
             mesh,
