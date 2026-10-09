@@ -54,6 +54,12 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         # MiMo V2 Pro: E=384, H=6144, I=2048, top_k=8, fp8 e4m3, ep=8
         # Decode configs (tuned on bench-4 single-host v7x-16, 2026-05-21)
         ('bfloat16', 'float8_e4m3fn', 512, 384, 8, 6144, 2048, 8, False, False): (64, 1024, 32, 256, 32),
+        # GLM-5.3-Flash prefill: E=288, H=4096, I=2048, top_k=8, routed FP8 block-wise K=128,
+        # ep=8, in-kernel shared expert (2048), act_quant ON, swiglu_limit 10. Tuned
+        # 2026-09-30 on one v7x host (8 devices), bench_v2.py BENCH_TUNE=1. Batches of >= 1024
+        # tokens take the grouped-matmul path (moe_gmm_prefill.py), so only 256 / 512 are listed.
+        ('bfloat16', 'float8_e4m3fn', 256, 288, 8, 4096, 2048, 8, True, False, True): (32, 1024, 32, 1024, 32),
+        ('bfloat16', 'float8_e4m3fn', 512, 288, 8, 4096, 2048, 8, True, False, True): (64, 2048, 64, 1024, 64),
         # GLM-5.2: E=256, H=6144, I=2048, top_k=8, routed FP8 block-wise
         # K=128, ep=16, in-kernel shared expert, act_quant ON, no grouped top-k.
         # Tuned on 8 TPU v7x chips / 16 JAX devices, 2026-08-04
