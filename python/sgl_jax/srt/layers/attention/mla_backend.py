@@ -227,41 +227,31 @@ class MLAAttentionBackend(AttentionBackend):
     # each valid request's page-start token locations over its page-aligned
     # ``allocate_len`` region. dp_size == 1 only.
 
-    def _spec_request_pages(self, batch: ModelWorkerBatch):
-        """Per padded request slot: its physical page ids (None for padding slots)."""
-        if batch.dp_size != 1:
-            raise NotImplementedError("MLA speculative metadata supports dp_size == 1 only")
-        seq_lens = np.asarray(batch.seq_lens)
-        valid = seq_lens > 0
-        allocate_lens = np.asarray(batch.spec_info_padded.allocate_lens)
-        if len(allocate_lens) == len(seq_lens):
-            allocate_lens = allocate_lens[valid]
-        n_valid = int(valid.sum())
-        assert len(allocate_lens) >= n_valid, (len(allocate_lens), n_valid)
-        cache_loc = np.asarray(batch.cache_loc)
-        pages: list[np.ndarray | None] = [None] * len(seq_lens)
-        base = 0
-        for slot, alloc in zip(np.nonzero(valid)[0], allocate_lens[:n_valid]):
-            aligned = int(cdiv(int(alloc), self.page_size)) * self.page_size
-            pages[slot] = cache_loc[base : base + aligned : self.page_size] // self.page_size
-            base += aligned
-        return pages, len(cache_loc) // self.page_size
-
     def spec_chain_layout(self, batch: ModelWorkerBatch) -> dict:
         """Length-independent host layout of one speculative round (topk=1 chain):
         ``valid`` [bs] and ``page_indices`` [bs * pages_per_seq]. Lengths are applied by
         :meth:`spec_metadata_arrays` (on host, or in-JIT when they live on device)."""
-        slot_pages, total_pages = self._spec_request_pages(batch)
+        if batch.dp_size != 1:
+            raise NotImplementedError("MLA speculative metadata supports dp_size == 1 only")
         valid = np.asarray(batch.seq_lens) > 0
         n_valid = int(valid.sum())
         assert valid[:n_valid].all() and not valid[n_valid:].any(), "valid rows must be a prefix"
+        allocate_lens = np.asarray(batch.spec_info_padded.allocate_lens)[:n_valid]
+        assert len(allocate_lens) == n_valid, (len(allocate_lens), n_valid)
+        cache_loc = np.asarray(batch.cache_loc)
         # Static stride: every request's pages must fit (max_pages_per_seq bounds the context
         # plus the chain; without it, the whole batch's page capacity).
-        stride = getattr(self, "max_pages_per_seq", None) or total_pages
+        stride = getattr(self, "max_pages_per_seq", None) or len(cache_loc) // self.page_size
         page_indices = np.zeros((len(valid), stride), dtype=np.int32)
-        for r in range(n_valid):
-            assert len(slot_pages[r]) <= stride, (len(slot_pages[r]), stride)
-            page_indices[r, : len(slot_pages[r])] = slot_pages[r]
+        base = 0
+        for r, alloc in enumerate(allocate_lens):
+            # cache_loc packs each request's page-start token locations over its page-aligned
+            # allocate_len region.
+            aligned = int(cdiv(int(alloc), self.page_size)) * self.page_size
+            pages = cache_loc[base : base + aligned : self.page_size] // self.page_size
+            assert len(pages) <= stride, (len(pages), stride)
+            page_indices[r, : len(pages)] = pages
+            base += aligned
         return {"valid": valid, "page_indices": page_indices.reshape(-1)}
 
     @staticmethod

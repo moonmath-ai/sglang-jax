@@ -6,8 +6,9 @@ attention runs over at most ``index_topk`` KV positions per query. IndexShare
 through the model's per-layer loop and reusing it on ``shared`` layers.
 
 Phase A path uses jnp reference kernels (:mod:`sgl_jax.srt.kernels.dsa.ref`);
-DECODE runs the Pallas ``sparse_mla_page_level``; EXTEND falls back to
-plain dense (the indexer still writes idx cache for later decode steps).
+DECODE runs the Pallas ``sparse_mla_page_level``; speculative chains (TARGET_VERIFY /
+DRAFT_EXTEND, T causal queries per request) run ``sparse_mla_chain_request_level``; EXTEND
+falls back to plain dense (the indexer still writes idx cache for later decode steps).
 """
 
 from __future__ import annotations
@@ -328,22 +329,11 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         is_spec_chain = mode.is_target_verify() or mode.is_draft_extend()
         is_decode = mode.is_decode() or is_spec_chain
         if is_full and q_idx is None:
+            # No indexer projections on this layer: no top-k to compute or share.
             o, kv_cache = self._run_dense(
                 q, q_rope, new_kv_c, new_k_pe, kv_cache, sm_scale, layer, dpa, md
             )
-            idx_cache, topk, topk_pages = self._maybe_index(
-                is_full,
-                q_idx,
-                k_idx,
-                idx_weights,
-                idx_cache,
-                dpa,
-                md,
-                compute_topk=is_decode,
-                compute_pages=is_decode,
-                chain=is_spec_chain,
-            )
-            return o, DSAFusedCache(kv=kv_cache, idx=idx_cache, topk=topk, topk_pages=topk_pages)
+            return o, DSAFusedCache(kv=kv_cache, idx=idx_cache, topk=None, topk_pages=None)
 
         # ── W7: spec verify / draft-extend in decode form ─────────────────
         mode = forward_batch.forward_mode
@@ -489,15 +479,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             o, kv_cache = self._run_sparse_chain(
                 q, q_rope, new_kv_c, new_k_pe, kv_cache, topk_pages_use, sm_scale, dpa, md
             )
-            return o, DSAFusedCache(
-                kv=kv_cache,
-                idx=idx_cache,
-                topk=topk if is_full else None,
-                topk_pages=topk_pages if is_full else None,
+        else:
+            o, kv_cache = self._run_sparse(
+                q, q_rope, new_kv_c, new_k_pe, kv_cache, topk_use, topk_pages_use, sm_scale, dpa, md
             )
-        o, kv_cache = self._run_sparse(
-            q, q_rope, new_kv_c, new_k_pe, kv_cache, topk_use, topk_pages_use, sm_scale, dpa, md
-        )
         return o, DSAFusedCache(
             kv=kv_cache,
             idx=idx_cache,
@@ -560,7 +545,6 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     cuq_,
                     cukv_,
                     dist_,
-                    chain=chain,
                     compute_topk=compute_topk,
                     compute_pages=compute_pages,
                 )
@@ -665,7 +649,6 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         cukv_,
         dist_,
         *,
-        chain,
         compute_topk,
         compute_pages,
     ):
@@ -702,41 +685,24 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 jnp.full((q_.shape[0], 1), -1, jnp.int32),
             )
         k_pools = self.index_topk // kp
-        if chain:
-            # Speculative chain (request layout): one causal multi-query pass per request.
-            Tq = q_.shape[0] // seq_lens_.shape[0]
-            pools = streamindex_topk_live(
-                q_,
-                w_,
-                blocks,
-                seq_lens_,
-                pi_ * bpp,
-                cuq_,
-                cukv_,
-                dist_,
-                k=k_pools,
-                pages_per_seq=pages_per_seq,
-                compression_ratio=kp,
-                queries_per_seq=Tq,
-            )
-            # Query j of request r sits at position seq_lens[r] - Tq + j.
-            q_pos = (seq_lens_[:, None] - Tq + jnp.arange(Tq)[None, :]).reshape(-1)
-        else:
-            pools = streamindex_topk_live(
-                q_,
-                w_,
-                blocks,
-                seq_lens_,
-                pi_ * bpp,
-                cuq_,
-                cukv_,
-                dist_,
-                k=k_pools,
-                pages_per_seq=pages_per_seq,
-                compression_ratio=kp,
-            )
-            # Decode: query t is sequence t, at position seq_lens[t] - 1.
-            q_pos = seq_lens_[: q_.shape[0]] - 1
+        # Each sequence ends in Tq causal queries: 1 for decode, the chain length for a
+        # speculative chain in request layout. Query j of sequence b sits at seq_lens[b] - Tq + j.
+        Tq = q_.shape[0] // seq_lens_.shape[0]
+        pools = streamindex_topk_live(
+            q_,
+            w_,
+            blocks,
+            seq_lens_,
+            pi_ * bpp,
+            cuq_,
+            cukv_,
+            dist_,
+            k=k_pools,
+            pages_per_seq=pages_per_seq,
+            compression_ratio=kp,
+            queries_per_seq=Tq,
+        )
+        q_pos = (seq_lens_[:, None] - Tq + jnp.arange(Tq)[None, :]).reshape(-1)
         topk = _kpool_expand(pools, q_pos, kpool=kp, k_tokens=self.index_topk)
         if not compute_pages:
             topk_pages = jnp.full((topk.shape[0], 1), -1, jnp.int32)

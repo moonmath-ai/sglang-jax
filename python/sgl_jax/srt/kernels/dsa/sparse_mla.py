@@ -395,9 +395,8 @@ def sparse_mla_chain_request_level(
 ) -> tuple[jax.Array, jax.Array]:
     """Page-level sparse MLA for speculative chains, one causal ``Tq``-query pass per request.
 
-    ``sparse_mla_page_level`` runs each of a request's ``Tq`` chain tokens as its own
-    one-query sequence, so the request's hit pages are read ``Tq`` times. Here each request
-    attends the union of its queries' hit pages once, with the chain's own page(s) appended
+    Each request attends the union of its ``Tq`` queries' hit pages once (instead of once per
+    query, as ``sparse_mla_page_level`` would), with the chain's own page(s) appended
     last so the chain tokens are the final ``Tq`` positions and the ragged kernel's causal
     rule (query ``i`` sees ``kv_len - Tq + i`` and earlier) applies. NoPE MLA is position
     free, so page order is irrelevant. Same page-level (superset) semantics as the per-query
@@ -408,6 +407,8 @@ def sparse_mla_chain_request_level(
     Returns ``(o_latent [B*Tq, H, kv_lora_rank], updated cache)``.
     """
     Tq = queries_per_seq
+    # The chain's own KV spans at most two pages (it is appended as up to 2 pages below).
+    assert Tq <= page_size, f"queries_per_seq={Tq} > page_size={page_size}"
     B = req_seq_lens.shape[0]
     pps = req_page_indices.shape[0] // B
     big = jnp.iinfo(jnp.int32).max
