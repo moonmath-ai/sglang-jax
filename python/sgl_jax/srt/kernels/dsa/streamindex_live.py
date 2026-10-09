@@ -19,6 +19,8 @@ from sgl_jax.srt.kernels.dsa.streamindex_topk import streamindex_topk
 # selection for all rows, instead of a loop over groups of 4 rows with a bucket switch per
 # group. DSA_INDEXER_SINGLE_PASS=0 restores the grouped loop.
 _SINGLE_PASS = os.environ.get("DSA_INDEXER_SINGLE_PASS", "1") == "1"
+# Active rows above which the single pass is used (one row group of the grouped loop).
+_SINGLE_PASS_MIN_ROWS = 4
 
 
 def _page_buckets(pages_per_seq: int, pages_per_block: int) -> tuple[int, ...]:
@@ -99,7 +101,7 @@ def streamindex_topk_live(
     if batch == 0:
         return jnp.full((0, k), -1, jnp.int32)
 
-    if _SINGLE_PASS:
+    def _single_pass():
         dbs = min(4, batch)
         padded = -(-batch // dbs) * dbs
         starts = cu_kv_lens[:batch] // (page_size * compression_ratio)
@@ -143,87 +145,98 @@ def streamindex_topk_live(
         sel = jax.lax.switch(bucket, [_branch(bp) for bp in buckets], None)[:batch]
         return jnp.where((lengths > 0)[:, None], sel, -1)
 
-    group_size = min(4, batch)
-    # Leave one group's lookahead after the real rows: a bucket run can end
-    # at any row, so the final partial group still needs a full static slice.
-    padded_batch = ((batch + group_size - 1) // group_size) * group_size + group_size - 1
-    if padded_batch != batch:
-        q = jnp.pad(q, ((0, padded_batch - batch), (0, 0), (0, 0)))
-        weights = jnp.pad(weights, ((0, padded_batch - batch), (0, 0)))
-        seq_lens = jnp.pad(seq_lens, ((0, padded_batch - batch),))
-        page_starts = jnp.pad(
-            cu_kv_lens[:-1] // (page_size * compression_ratio), ((0, padded_batch - batch),)
-        )
-    else:
-        page_starts = cu_kv_lens[:-1] // (page_size * compression_ratio)
-
-    row_ids = jnp.arange(padded_batch, dtype=jnp.int32)
-    active = (row_ids < distribution[0]) & (seq_lens > 0)
-    row_buckets = jnp.sum(seq_lens[:, None] > limits[None, :], axis=1, dtype=jnp.int32)
-    row_buckets = jnp.where(active, row_buckets, len(buckets))
-    order = jnp.argsort(row_buckets, stable=True)
-    sorted_buckets = row_buckets[order]
-    active_count = jnp.sum(active, dtype=jnp.int32)
-
-    # cu_q_lens is an ignored ABI slot (decode: query i belongs to sequence i).
-    one_cuq = jnp.arange(group_size + 1, dtype=jnp.int32)
-    one_dist = jnp.asarray([group_size, group_size, group_size], jnp.int32)
-    # Pad by the largest window so every row window stays in bounds without shifting (the
-    # old per-element clamp only ever affected pages past a row's live length).
-    padded_pages = jnp.concatenate(
-        [page_indices, jnp.full((buckets[-1],), page_indices[-1], page_indices.dtype)]
-    )
-    bucket_branches = []
-
-    for bucket_pages in buckets:
-
-        def score_and_select(args, bucket_pages=bucket_pages):
-            q_group, w_group, lengths_group, starts_group, group_order, out = args
-            # Row windows of the (padded) page table: one gather for the group.
-            pages = padded_pages[
-                starts_group[:, None] + jnp.arange(bucket_pages, dtype=jnp.int32)[None, :]
-            ].reshape(-1)
-            selected = streamindex_topk(
-                q_group,
-                w_group,
-                cache4d,
-                lengths_group,
-                pages,
-                one_cuq,
-                one_dist,
-                k=k,
-                compression_ratio=compression_ratio,
-                num_kv_pages_per_block=min(bucket_pages, num_kv_pages_per_block),
-                num_queries_per_block=1,
-                decode_req_batch_size=group_size,
+    def _grouped(q, weights, seq_lens):
+        group_size = min(4, batch)
+        # Leave one group's lookahead after the real rows: a bucket run can end
+        # at any row, so the final partial group still needs a full static slice.
+        padded_batch = ((batch + group_size - 1) // group_size) * group_size + group_size - 1
+        if padded_batch != batch:
+            q = jnp.pad(q, ((0, padded_batch - batch), (0, 0), (0, 0)))
+            weights = jnp.pad(weights, ((0, padded_batch - batch), (0, 0)))
+            seq_lens = jnp.pad(seq_lens, ((0, padded_batch - batch),))
+            page_starts = jnp.pad(
+                cu_kv_lens[:-1] // (page_size * compression_ratio), ((0, padded_batch - batch),)
             )
-            old = out[group_order]
-            return out.at[group_order].set(jnp.where(lengths_group[:, None] > 0, selected, old))
+        else:
+            page_starts = cu_kv_lens[:-1] // (page_size * compression_ratio)
 
-        bucket_branches.append(score_and_select)
+        row_ids = jnp.arange(padded_batch, dtype=jnp.int32)
+        active = (row_ids < distribution[0]) & (seq_lens > 0)
+        row_buckets = jnp.sum(seq_lens[:, None] > limits[None, :], axis=1, dtype=jnp.int32)
+        row_buckets = jnp.where(active, row_buckets, len(buckets))
+        order = jnp.argsort(row_buckets, stable=True)
+        sorted_buckets = row_buckets[order]
+        active_count = jnp.sum(active, dtype=jnp.int32)
 
-    def condition(carry):
-        cursor, _ = carry
-        return cursor < active_count
-
-    def group_step(carry):
-        cursor, out = carry
-        group_order = jax.lax.dynamic_slice_in_dim(order, cursor, group_size)
-        group_buckets = jax.lax.dynamic_slice_in_dim(sorted_buckets, cursor, group_size)
-        bucket = group_buckets[0]
-        in_bucket = group_buckets == bucket
-        run_size = jnp.sum(in_bucket, dtype=jnp.int32)
-        q_group = q[group_order]
-        w_group = weights[group_order]
-        lengths_group = jnp.where(in_bucket, seq_lens[group_order], 0)
-        starts_group = page_starts[group_order]
-        out = jax.lax.switch(
-            bucket,
-            tuple(bucket_branches),
-            (q_group, w_group, lengths_group, starts_group, group_order, out),
+        # cu_q_lens is an ignored ABI slot (decode: query i belongs to sequence i).
+        one_cuq = jnp.arange(group_size + 1, dtype=jnp.int32)
+        one_dist = jnp.asarray([group_size, group_size, group_size], jnp.int32)
+        # Pad by the largest window so every row window stays in bounds without shifting (the
+        # old per-element clamp only ever affected pages past a row's live length).
+        padded_pages = jnp.concatenate(
+            [page_indices, jnp.full((buckets[-1],), page_indices[-1], page_indices.dtype)]
         )
-        return cursor + run_size, out
+        bucket_branches = []
 
-    out = jnp.full((padded_batch, k), -1, jnp.int32)
-    _, out = jax.lax.while_loop(condition, group_step, (jnp.asarray(0, jnp.int32), out))
-    return out[:batch]
+        for bucket_pages in buckets:
+
+            def score_and_select(args, bucket_pages=bucket_pages):
+                q_group, w_group, lengths_group, starts_group, group_order, out = args
+                # Row windows of the (padded) page table: one gather for the group.
+                pages = padded_pages[
+                    starts_group[:, None] + jnp.arange(bucket_pages, dtype=jnp.int32)[None, :]
+                ].reshape(-1)
+                selected = streamindex_topk(
+                    q_group,
+                    w_group,
+                    cache4d,
+                    lengths_group,
+                    pages,
+                    one_cuq,
+                    one_dist,
+                    k=k,
+                    compression_ratio=compression_ratio,
+                    num_kv_pages_per_block=min(bucket_pages, num_kv_pages_per_block),
+                    num_queries_per_block=1,
+                    decode_req_batch_size=group_size,
+                )
+                old = out[group_order]
+                return out.at[group_order].set(jnp.where(lengths_group[:, None] > 0, selected, old))
+
+            bucket_branches.append(score_and_select)
+
+        def condition(carry):
+            cursor, _ = carry
+            return cursor < active_count
+
+        def group_step(carry):
+            cursor, out = carry
+            group_order = jax.lax.dynamic_slice_in_dim(order, cursor, group_size)
+            group_buckets = jax.lax.dynamic_slice_in_dim(sorted_buckets, cursor, group_size)
+            bucket = group_buckets[0]
+            in_bucket = group_buckets == bucket
+            run_size = jnp.sum(in_bucket, dtype=jnp.int32)
+            q_group = q[group_order]
+            w_group = weights[group_order]
+            lengths_group = jnp.where(in_bucket, seq_lens[group_order], 0)
+            starts_group = page_starts[group_order]
+            out = jax.lax.switch(
+                bucket,
+                tuple(bucket_branches),
+                (q_group, w_group, lengths_group, starts_group, group_order, out),
+            )
+            return cursor + run_size, out
+
+        out = jnp.full((padded_batch, k), -1, jnp.int32)
+        _, out = jax.lax.while_loop(condition, group_step, (jnp.asarray(0, jnp.int32), out))
+        return out[:batch]
+
+    if not _SINGLE_PASS:
+        return _grouped(q, weights, seq_lens)
+    # The single pass scores every (padded) decode row at the bucket of the longest live
+    # context, so with few active rows the grouped loop, which scores only active rows, is
+    # cheaper (e.g. one long request in a bs-16 decode bucket).
+    n_active = jnp.sum((jnp.arange(batch) < distribution[0]) & (seq_lens > 0))
+    return jax.lax.cond(
+        n_active > _SINGLE_PASS_MIN_ROWS, _single_pass, lambda: _grouped(q, weights, seq_lens)
+    )
