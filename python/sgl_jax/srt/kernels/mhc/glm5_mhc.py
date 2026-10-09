@@ -9,7 +9,7 @@ kernels, one per call site:
                         streams. Returns ``(collapsed [T, D], state [T, n_pad] f32)``.
   * ``glm5_mhc_post`` : ``out[:, j] = post[j] * y + sum_i comb[i, j] * streams[:, i]``.
 
-Math is exactly ``Glm5NextHC._mix`` / ``post`` (f32 everywhere):
+Math (f32 everywhere; reference: ``test_mhc_kernel.py``):
 
     pre  = sigmoid(pre_w * scale0 + base[:hc]) + hc_eps
     post = 2 * sigmoid(post_w * scale1 + base[hc:2hc])
@@ -18,9 +18,9 @@ Math is exactly ``Glm5NextHC._mix`` / ``post`` (f32 everywhere):
 
 Kernel design (pre):
   * Tokens are tiled ``bt`` rows per program; the whole hc*D feature row stays in VMEM.
-  * ``fn`` is re-laid-out (XLA side; once at load time via ``prepared``, else per call) as ``fn_t [n_pad, hc*D]``: every gate group
-    (pre, post, and comb column j for each j) starts on an 8-sublane boundary, so all in-kernel
-    slices are tile aligned (n_pad = 8 * (2 + hc) = 48 for hc=4).
+  * ``fn`` is re-laid-out once at load time (``prepare_fn_t``) as ``fn_t [n_pad, hc*D]``: every
+    gate group (pre, post, and comb column j for each j) starts on an 8-sublane boundary, so all
+    in-kernel slices are tile aligned (n_pad = 8 * (2 + hc) = 48 for hc=4).
   * ``mixT = fn_t . x^T`` (flash-attention style NT matmul) gives the projection with tokens on
     LANES: each gate group is one [8, bt] vreg-tile, the Sinkhorn row normalisation is plain
     element-wise math across the hc column tiles, and the column normalisation is an 8-row
@@ -46,6 +46,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.kernels.mhc.mhc import get_interpret
+
 _LANES = 128
 _SLAB = 8  # sublane tile: each gate group occupies one 8-row slab of fn_t / mixT
 _VMEM_LIMIT = 48 * 1024 * 1024
@@ -58,7 +60,7 @@ def _n_pad(hc: int) -> int:
 
 def _row_index(hc: int):
     """For each original mix column (pre[h], post[h], comb[i, j]) its row in the padded layout."""
-    rows = [h for h in range(hc)]
+    rows = list(range(hc))
     rows += [_SLAB + h for h in range(hc)]
     rows += [2 * _SLAB + j * _SLAB + i for i in range(hc) for j in range(hc)]  # comb[i, j]
     return jnp.asarray(rows, jnp.int32)
@@ -195,9 +197,9 @@ def _pre_kernel(
 )
 def glm5_mhc_pre(
     streams,
-    fn,
-    scale,
-    base,
+    fn_t,
+    scale_rows,
+    base_rows,
     *,
     hc: int,
     hc_iters: int,
@@ -205,34 +207,25 @@ def glm5_mhc_pre(
     eps: float,
     block_tokens: int | None = None,
     interpret: bool | None = None,
-    prepared=None,
 ):
-    """streams [T, hc*D], fn [hc*D, (2+hc)*hc], base [(2+hc)*hc], scale [3].
-
-    ``prepared``: optional ``(fn_t, scale_rows, base_rows)`` from ``prepare_fn_t`` /
-    ``prepare_params`` computed once at load time (``fn``/``scale``/``base`` are then unused).
+    """streams [T, hc*D]; ``fn_t`` from ``prepare_fn_t``, ``scale_rows``/``base_rows`` from
+    ``prepare_params`` (built once at load time).
 
     Returns (collapsed [T, D] in streams.dtype, state [T, n_pad] f32); see ``unpack_state``.
     """
     if interpret is None:
-        interpret = jax.default_backend() != "tpu"
+        interpret = get_interpret()
     t, k = streams.shape
     d = k // hc
     assert d * hc == k and d % 128 == 0, (streams.shape, hc)
     n_pad = _n_pad(hc)
     bt = _block_tokens(t, block_tokens)
 
-    w_dtype = (fn if prepared is None else prepared[0]).dtype
-    if streams.dtype == jnp.bfloat16 and w_dtype == jnp.bfloat16:
-        precision, op_dtype = None, jnp.bfloat16  # exact products, f32 MXU accumulation
+    if streams.dtype == jnp.bfloat16 and fn_t.dtype == jnp.bfloat16:
+        precision = None  # exact bf16 products, f32 MXU accumulation
     else:
-        precision, op_dtype = jax.lax.Precision.HIGHEST, jnp.float32
-    if prepared is None:
-        fn_t = prepare_fn_t(fn.astype(op_dtype), hc)
-        sc, bs = prepare_params(scale, base, hc)
-    else:
-        fn_t, sc, bs = prepared
-        fn_t = fn_t.astype(op_dtype)
+        precision = jax.lax.Precision.HIGHEST
+        fn_t = fn_t.astype(jnp.float32)
 
     kernel = functools.partial(
         _pre_kernel,
@@ -267,7 +260,7 @@ def glm5_mhc_pre(
         ),
         interpret=interpret,
         name="glm5-mhc-pre",
-    )(streams, fn_t, sc, bs)
+    )(streams, fn_t, scale_rows, base_rows)
 
 
 def _post_kernel(y_ref, x_ref, st_ref, o_ref, *, hc, d):
@@ -287,7 +280,7 @@ def glm5_mhc_post(
 ):
     """y [T, D], state [T, n_pad] (from glm5_mhc_pre), streams [T, hc*D] -> [T, hc*D]."""
     if interpret is None:
-        interpret = jax.default_backend() != "tpu"
+        interpret = get_interpret()
     t, k = streams.shape
     d = k // hc
     assert y.shape == (t, d) and d % 128 == 0, (y.shape, streams.shape)
@@ -309,7 +302,7 @@ def glm5_mhc_post(
         ),
         interpret=interpret,
         name="glm5-mhc-post",
-    )(y, streams, state.astype(jnp.float32))
+    )(y, streams, state)
 
 
 __all__ = ["glm5_mhc_pre", "glm5_mhc_post", "prepare_fn_t", "prepare_params", "unpack_state"]

@@ -23,20 +23,26 @@ there for the math and its provenance.
 from __future__ import annotations
 
 import logging
-import os
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.glm5_next import Glm5NextConfig, get_glm5_next_config
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
+from sgl_jax.srt.kernels.mhc.glm5_mhc import (
+    _n_pad,
+    glm5_mhc_post,
+    glm5_mhc_pre,
+    prepare_fn_t,
+    prepare_params,
+)
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sgl_jax.srt.layers.weight_loading import _put
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.models.glm5_moe import (
@@ -49,9 +55,6 @@ from sgl_jax.srt.models.glm5_moe import (
 from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention, kda_attention_mappings
 
 logger = logging.getLogger(__name__)
-
-# Fused Pallas mHC kernels (kernels/mhc/glm5_mhc.py) instead of the XLA reference chain.
-_MHC_KERNEL = os.environ.get("SGLANG_JAX_MHC_KERNEL", "1") == "1"
 
 
 class Glm5NextHC(nnx.Module):
@@ -70,9 +73,10 @@ class Glm5NextHC(nnx.Module):
         ... sublayer(h) -> y ...
         streams = post[..., None] * y[:, None, :] + comb @ streams  # write back
 
-    `fn` is stored [hc*D, (2+hc)*hc] (JAX in/out); `base` [(2+hc)*hc]; `scale` [3]. A per-Sinkhorn
-    normalisation is done with explicit slice adds (as in the reference) so the chain stays one
-    fusion.
+    Both halves run as the fused Pallas kernels of kernels/mhc/glm5_mhc.py (an XLA reference of
+    the math lives in test_mhc_kernel.py). The checkpoint's `fn` [(2+hc)*hc, hc*D], `base`
+    [(2+hc)*hc] and `scale` [3] are converted once at load (`prepare_weight_loading`) into the
+    kernel layout `fn_t` / `scale_rows` / `base_rows`.
     """
 
     def __init__(
@@ -90,99 +94,42 @@ class Glm5NextHC(nnx.Module):
         self.hc_eps = hc_eps
         self.eps = rms_eps
         self.mesh = mesh
-        n = (2 + hc_mult) * hc_mult
+        n_pad = _n_pad(hc_mult)
         sh = NamedSharding(mesh, P(None, None))
-        sh1 = NamedSharding(mesh, P(None))
-        self.fn = nnx.Param(jnp.zeros((hc_mult * hidden_size, n), dtype=dtype, out_sharding=sh))
-        self.base = nnx.Param(jnp.zeros((n,), dtype=jnp.float32, out_sharding=sh1))
-        self.scale = nnx.Param(jnp.zeros((3,), dtype=jnp.float32, out_sharding=sh1))
-        if _MHC_KERNEL:  # kernel-layout copies of fn/scale/base, built at load
-            from sgl_jax.srt.kernels.mhc.glm5_mhc import _n_pad
-
-            n_pad = _n_pad(hc_mult)
-            self.fn_t = nnx.Param(
-                jnp.zeros((n_pad, hc_mult * hidden_size), dtype=dtype, out_sharding=sh)
-            )
-            self.scale_rows = nnx.Param(jnp.zeros((n_pad, 128), dtype=jnp.float32, out_sharding=sh))
-            self.base_rows = nnx.Param(jnp.zeros((n_pad, 128), dtype=jnp.float32, out_sharding=sh))
+        self.fn_t = nnx.Param(
+            jnp.zeros((n_pad, hc_mult * hidden_size), dtype=dtype, out_sharding=sh)
+        )
+        self.scale_rows = nnx.Param(jnp.zeros((n_pad, 128), dtype=jnp.float32, out_sharding=sh))
+        self.base_rows = nnx.Param(jnp.zeros((n_pad, 128), dtype=jnp.float32, out_sharding=sh))
 
     def prepare_weight_loading(self, loader, mappings, prefix):
-        # The kernel reads fn/scale/base in a padded row layout: load fn/base/scale through one
-        # recipe that also builds those copies, instead of re-laying them out on every call.
-        if not hasattr(self, "fn_t"):
-            return mappings
+        # Load the checkpoint's fn/base/scale through one recipe that builds the kernel layout.
         targets = tuple(f"{prefix}.{name}" for name in ("fn", "base", "scale"))
         by_target = {
             spec.target_path: source
             for source, spec in mappings.items()
             if isinstance(spec.target_path, str)
         }
-        if not all(target in by_target for target in targets):
-            return mappings
+        missing = [target for target in targets if target not in by_target]
+        if missing:
+            raise ValueError(f"mHC weights missing from the checkpoint mappings: {missing}")
         sources = tuple(by_target[target] for target in targets)
         mappings = {key: spec for key, spec in mappings.items() if key not in sources}
         mappings[sources[0]] = WeightSpec(
-            [*targets, f"{prefix}.fn_t", f"{prefix}.scale_rows", f"{prefix}.base_rows"],
+            [f"{prefix}.fn_t", f"{prefix}.scale_rows", f"{prefix}.base_rows"],
             sources=sources,
             recipe=self._prepare_weights,
         )
         return mappings
 
     def _prepare_weights(self, inputs):
-        """(fn [n, hc*D] as stored in the checkpoint, base, scale) -> fn, base, scale and the
-        kernel layout of glm5_mhc.prepare_fn_t / prepare_params, all replicated."""
-        from sgl_jax.srt.kernels.mhc.glm5_mhc import _LANES, _n_pad, _row_index
-
-        fn_hf, base, scale = (np.asarray(x) for x in inputs)
-        hc, n_pad = self.hc, _n_pad(self.hc)
-        rows = np.asarray(_row_index(hc))
-        dtype = self.fn.value.dtype
-        base, scale = base.astype(np.float32), scale.astype(np.float32)
-        fn_t = np.zeros((n_pad, fn_hf.shape[1]), dtype)
-        fn_t[rows] = fn_hf.astype(dtype)
-        seg = np.asarray([0] * hc + [1] * hc + [2] * (hc * hc))
-        sc = np.zeros((n_pad,), np.float32)
-        sc[rows] = scale[seg]
-        bs = np.zeros((n_pad,), np.float32)
-        bs[rows] = base
-        lanes = lambda v: np.ascontiguousarray(np.broadcast_to(v[:, None], (n_pad, _LANES)))
-        outputs = (fn_hf.T.astype(dtype), base, scale, fn_t, lanes(sc), lanes(bs))
-        return tuple(
-            jax.make_array_from_callback(
-                w.shape,
-                NamedSharding(self.mesh, P(*([None] * w.ndim))),
-                lambda index, w=w: w[index],
-            )
-            for w in outputs
-        )
-
-    def _mix(self, streams: jax.Array):
-        """streams: [..., hc*D] (hc streams concatenated on the last axis)."""
-        hc = self.hc
-        lead = streams.shape[:-1]
-        d = streams.shape[-1] // hc
-        flat = streams.reshape(*lead, hc * d).astype(jnp.float32)
-        flat = flat * jax.lax.rsqrt(jnp.mean(flat * flat, -1, keepdims=True) + self.eps)
-        mix = flat @ self.fn.value.astype(jnp.float32)
-        pre_w, post_w, comb_w = mix[..., :hc], mix[..., hc : 2 * hc], mix[..., 2 * hc :]
-        base, scale = self.base.value, self.scale.value
-        pre = jax.nn.sigmoid(pre_w * scale[0] + base[:hc]) + self.hc_eps
-        post = 2.0 * jax.nn.sigmoid(post_w * scale[1] + base[hc : 2 * hc])
-        comb = (
-            jax.nn.softmax(
-                comb_w.reshape(*lead, hc, hc) * scale[2] + base[2 * hc :].reshape(hc, hc), -1
-            )
-            + self.hc_eps
-        )
-        rsum = lambda c: sum(c[..., :, j : j + 1] for j in range(hc))
-        csum = lambda c: sum(c[..., j : j + 1, :] for j in range(hc))
-        comb = comb / (csum(comb) + self.hc_eps)
-        for _ in range(self.hc_iters - 1):
-            comb = comb / (rsum(comb) + self.hc_eps)
-            comb = comb / (csum(comb) + self.hc_eps)
-        streams_htd = streams.reshape(*lead, hc, d).astype(jnp.float32)
-        collapsed = jnp.einsum("...h,...hd->...d", pre, streams_htd).astype(streams.dtype)
-        return post, comb, collapsed
+        """(fn [n, hc*D] as stored in the checkpoint, base, scale) -> the replicated kernel
+        layout (fn_t, scale_rows, base_rows) of glm5_mhc.prepare_fn_t / prepare_params."""
+        fn, base, scale = (_put(x, self.mesh, ()) for x in inputs)
+        fn_t = prepare_fn_t(fn.T.astype(self.fn_t.value.dtype), self.hc)
+        scale_rows, base_rows = prepare_params(scale, base, self.hc)
+        rep = NamedSharding(self.mesh, P())
+        return tuple(jax.device_put(w, rep) for w in (fn_t, scale_rows, base_rows))
 
     def _shard_kernel(self, fn, token_args, rep_args, n_out=1):
         """Run a Pallas mHC kernel per shard. All mHC math is per token, so token-major args keep
@@ -211,51 +158,33 @@ class Glm5NextHC(nnx.Module):
         )(*token_args, *rep_args)
 
     def _kernel_pre(self, streams, fn_t, scale_rows, base_rows):
-        from sgl_jax.srt.kernels.mhc.glm5_mhc import glm5_mhc_pre
-
         return glm5_mhc_pre(
             streams,
-            None,
-            None,
-            None,
+            fn_t,
+            scale_rows,
+            base_rows,
             hc=self.hc,
             hc_iters=self.hc_iters,
             hc_eps=self.hc_eps,
             eps=self.eps,
-            prepared=(fn_t, scale_rows, base_rows),
         )
 
     def _kernel_post(self, y, state, streams):
-        from sgl_jax.srt.kernels.mhc.glm5_mhc import glm5_mhc_post
-
         return glm5_mhc_post(y, state, streams, hc=self.hc)
 
     def pre(self, streams: jax.Array):
-        if _MHC_KERNEL and streams.ndim == 2:
-            collapsed, state = self._shard_kernel(
-                self._kernel_pre,
-                (streams,),
-                (self.fn_t.value, self.scale_rows.value, self.base_rows.value),
-                n_out=2,
-            )
-            return collapsed, state  # state: [T, n_pad] f32 packed gates (glm5_mhc.unpack_state)
-        post, comb, collapsed = self._mix(streams)
-        return collapsed, (post, comb)
+        """streams [T, hc*D] -> (collapsed [T, D], state [T, n_pad] f32 packed gates, see
+        glm5_mhc.unpack_state)."""
+        return self._shard_kernel(
+            self._kernel_pre,
+            (streams,),
+            (self.fn_t.value, self.scale_rows.value, self.base_rows.value),
+            n_out=2,
+        )
 
     def post(self, y: jax.Array, state, streams: jax.Array):
-        """y: [..., D] sublayer output. Returns the new [..., hc*D] streams."""
-        if not isinstance(state, tuple):  # packed state from the fused kernel path
-            return self._shard_kernel(self._kernel_post, (y, state, streams), ())
-        post, comb = state
-        hc = self.hc
-        lead = streams.shape[:-1]
-        d = streams.shape[-1] // hc
-        streams_htd = streams.reshape(*lead, hc, d).astype(jnp.float32)
-        y = y.astype(jnp.float32)
-        out = post[..., None] * y[..., None, :] + jnp.einsum(
-            "...ij,...id->...jd", comb, streams_htd
-        )
-        return out.reshape(*lead, hc * d).astype(streams.dtype)
+        """y [T, D] sublayer output, state from `pre`. Returns the new [T, hc*D] streams."""
+        return self._shard_kernel(self._kernel_post, (y, state, streams), ())
 
 
 class Glm5NextDecoderLayer(nnx.Module):
