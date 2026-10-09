@@ -15,7 +15,11 @@ from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
-from sgl_jax.test.test_utils import KDAAttnBackendForTest
+from sgl_jax.test.test_utils import (
+    KDAAttnBackendForTest,
+    kda_conv_from_tiled,
+    kda_conv_to_tiled,
+)
 
 mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 jax.sharding.set_mesh(mesh)
@@ -234,7 +238,9 @@ def write_initial_state(
         ssm_state, out_sharding=pool.recurrent_sharding
     )
     conv_buffer = (
-        conv_buffer_list[0].at[recurrent_indices].set(conv_state, out_sharding=pool.conv_sharding)
+        conv_buffer_list[0]
+        .at[recurrent_indices]
+        .set(kda_conv_to_tiled(conv_state, pool.head_dim), out_sharding=pool.conv_sharding)
     )
     pool.replace_buffer(([recurrent_buffer], [[conv_buffer]]))
 
@@ -244,7 +250,7 @@ def gather_ssm(pool: RecurrentStatePool, recurrent_buffer: jax.Array, indices: n
 
 
 def gather_conv(pool: RecurrentStatePool, conv_buffer: jax.Array, indices: np.ndarray):
-    return conv_buffer.at[indices].get(out_sharding=pool.conv_sharding)
+    return kda_conv_from_tiled(np.asarray(conv_buffer)[np.asarray(indices)])
 
 
 def create_test_data(
@@ -320,6 +326,7 @@ def create_test_data(
         data_partition_axis="data",
         temporal_dtype=jnp.float32,
         conv_dtype=dtype,
+        conv_tiled=True,
     )
     # q/k/v/a/b unsharded for ref; reshard in run_test for the backend call.
     q = normal((total_tokens, hidden))
@@ -344,7 +351,7 @@ def create_test_data(
 
     # Reshard initial state for the (sharded) pool; keep host copies for ref.
     initial_ssm_state_dev_sharded = jax.device_put(initial_ssm_state_dev, pool.recurrent_sharding)
-    initial_conv_state_dev_sharded = jax.device_put(initial_conv_state_dev, pool.conv_sharding)
+    initial_conv_state_dev_sharded = initial_conv_state_dev
     write_initial_state(
         pool,
         layer_id,
@@ -761,6 +768,7 @@ class TestKDAAttention(unittest.TestCase):
                 data_partition_axis="data",
                 temporal_dtype=jnp.float32,
                 conv_dtype=self.DTYPE,
+                conv_tiled=True,
             )
             running = np.asarray(recurrent_indices)  # [1, 2]
             track = running + batch_size  # [3, 4] (free slots)

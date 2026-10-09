@@ -22,16 +22,26 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 
-def _conv_tiled_to_legacy(x):
-    """Local [B, K-1, 3, H, D] -> [B, 3*H*D, K-1] (per-shard [q|k|v] packing)."""
+# Conv pool layout (lane-dense, see RecurrentStatePool conv_tiled): [slots, K-1, 3, H, D] with
+# the q/k/v streams on axis 2 and heads sharded over "tensor". The short-conv kernels take
+# one stream at a time as [B, H*D, K-1].
+_CONV_POOL_SPEC = P("data", None, None, "tensor", None)
+_CONV_STREAM_SPEC = P("data", "tensor", None)
+
+
+def _conv_pool_to_streams(x):
+    """Local [B, K-1, 3, H, D] -> three [B, H*D, K-1]."""
     B, km1 = x.shape[:2]
-    return jnp.swapaxes(x.reshape(B, km1, -1), 1, 2)
+    return tuple(jnp.swapaxes(x[:, :, s].reshape(B, km1, -1), 1, 2) for s in range(3))
 
 
-def _conv_legacy_to_tiled(x, head_dim):
-    """Local [..., 3*H*D, K-1] -> [..., K-1, 3, H, D]."""
-    *lead, proj, km1 = x.shape
-    return jnp.swapaxes(x, -1, -2).reshape(*lead, km1, 3, proj // (3 * head_dim), head_dim)
+def _conv_streams_to_pool(streams, head_dim):
+    """Inverse of :func:`_conv_pool_to_streams`."""
+    *lead, hd, km1 = streams[0].shape
+    return jnp.stack(
+        [jnp.swapaxes(x, -1, -2).reshape(*lead, km1, hd // head_dim, head_dim) for x in streams],
+        axis=-3,
+    )
 
 
 if TYPE_CHECKING:
@@ -85,12 +95,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         q_conv_w = layer.q_conv1d.weight.value
         k_conv_w = layer.k_conv1d.weight.value
         v_conv_w = layer.v_conv1d.weight.value
-        # _unpack_conv_states splits proj_size in 3 equal pieces; only valid
-        # when proj_q == proj_k == proj_v (Kimi-Linear shape).
-        assert (
-            q_conv_w.shape[0] == k_conv_w.shape[0] == v_conv_w.shape[0]
-        ), f"unequal Q/K/V proj widths: {q_conv_w.shape[0]}/{k_conv_w.shape[0]}/{v_conv_w.shape[0]}"
-        q_state, k_state, v_state = self._unpack_conv_states(conv_states)
+        q_state, k_state, v_state = conv_states
 
         cu_q_lens = self.forward_metadata.cu_q_lens
         if forward_batch.forward_mode == ForwardMode.EXTEND:
@@ -128,7 +133,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 forward_batch.forward_mode,
                 activation=layer.activation,
             )
-        new_conv_packed = self._pack_conv_states(q_state_new, k_state_new, v_state_new)
+        new_conv = (q_state_new, k_state_new, v_state_new)
 
         q = q.reshape(q.shape[0], layer.num_q_heads, layer.head_q_dim)
         k = k.reshape(k.shape[0], layer.num_k_heads, layer.head_k_dim)
@@ -171,7 +176,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             recurrent_state_pool, layer.layer_id, recurrent_indices, new_recurrent
         )
         new_conv_full_list = self.set_conv_state(
-            recurrent_state_pool, layer.layer_id, recurrent_indices, new_conv_packed
+            recurrent_state_pool, layer.layer_id, recurrent_indices, new_conv
         )
 
         # Track snapshot: boundaries are forced to forward ends, so the
@@ -184,7 +189,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 new_ssm_full, track_indices, track_mask, new_recurrent
             )
             new_conv_full_list = self.set_conv_track_state(
-                new_conv_full_list, track_indices, track_mask, new_conv_packed
+                new_conv_full_list, track_indices, track_mask, new_conv
             )
 
         return output.reshape(output.shape[0], -1), (new_ssm_full, new_conv_full_list)
@@ -210,26 +215,19 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             check_vma=False,
         )(recurrent_buffer, recurrent_indices)
 
-        tiled = conv_buffer.ndim == 5  # pool conv_tiled: [slots, K-1, 3, H, D]
+        assert conv_buffer.ndim == 5, "KDA needs the tiled conv layout (conv_tiled)"
         conv = jax.shard_map(
-            (
-                (lambda buf, idx: _conv_tiled_to_legacy(buf[idx]))
-                if tiled
-                else (lambda buf, idx: buf[idx])
-            ),
+            lambda buf, idx: _conv_pool_to_streams(buf[idx]),
             mesh=self.mesh,
-            in_specs=(
-                P("data", None, None, "tensor", None) if tiled else P("data", "tensor", None),
-                P("data"),
-            ),
-            out_specs=P("data", "tensor", None),
+            in_specs=(_CONV_POOL_SPEC, P("data")),
+            out_specs=(_CONV_STREAM_SPEC,) * 3,
             check_vma=False,
         )(conv_buffer, recurrent_indices)
 
         has_initial_state = self.forward_metadata.has_initial_state
         if has_initial_state is not None:
             ssm = jnp.where(has_initial_state[:, None, None, None], ssm, 0.0)
-            conv = jnp.where(has_initial_state[:, None, None], conv, 0.0)
+            conv = tuple(jnp.where(has_initial_state[:, None, None], c, 0.0) for c in conv)
 
         return ssm, conv
 
@@ -258,32 +256,28 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             check_vma=False,
         )(full_recurrent, recurrent_indices, new_recurrent)
 
-    def _scatter_conv(self, full_conv, dst, keep, new_conv_packed):
-        """``full_conv[dst] = new_conv_packed`` (legacy [B, proj, K-1] packing, converted for the
-        tiled layout) except rows where ``keep`` is True."""
-        tiled = full_conv.ndim == 5
+    def _scatter_conv(self, full_conv, dst, keep, new_conv):
+        """``full_conv[dst] = new_conv`` (per-stream q/k/v states) except rows where ``keep``."""
         hd = full_conv.shape[-1]
 
-        def _scatter(buf, d, kp, val):
-            if tiled:
-                val = _conv_legacy_to_tiled(val, hd)
+        def _scatter(buf, d, kp, *streams):
+            val = _conv_streams_to_pool(streams, hd)
             kp = kp.reshape((-1,) + (1,) * (buf.ndim - 1))
             return buf.at[d].set(jnp.where(kp, buf[d], val.astype(buf.dtype)))
 
-        buf_spec = P("data", None, None, "tensor", None) if tiled else P("data", "tensor", None)
         return jax.shard_map(
             _scatter,
             mesh=self.mesh,
-            in_specs=(buf_spec, P("data"), P("data"), P("data", "tensor", None)),
-            out_specs=buf_spec,
+            in_specs=(_CONV_POOL_SPEC, P("data"), P("data")) + (_CONV_STREAM_SPEC,) * 3,
+            out_specs=_CONV_POOL_SPEC,
             check_vma=False,
-        )(full_conv, dst, keep, new_conv_packed)
+        )(full_conv, dst, keep, *new_conv)
 
-    def set_conv_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_conv_packed):
-        """Scatter per-request packed conv state. Same idx==0 guard as set_ssm_state."""
+    def set_conv_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_conv):
+        """Scatter per-request conv state. Same idx==0 guard as set_ssm_state."""
         _, conv_buffer_list = self.get_layer_cache(recurrent_state_pool, layer_id)
         new_conv_full = self._scatter_conv(
-            conv_buffer_list[0], recurrent_indices, recurrent_indices == 0, new_conv_packed
+            conv_buffer_list[0], recurrent_indices, recurrent_indices == 0, new_conv
         )
         return [new_conv_full] + list(conv_buffer_list[1:])
 
@@ -316,8 +310,8 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )(full_recurrent, track_indices, track_mask, new_recurrent)
         return jax.lax.optimization_barrier(new_full)
 
-    def set_conv_track_state(self, new_conv_full_list, track_indices, track_mask, new_conv_packed):
-        """Scatter ``new_conv_packed`` into the request track slots.
+    def set_conv_track_state(self, new_conv_full_list, track_indices, track_mask, new_conv):
+        """Scatter ``new_conv`` into the request track slots.
 
         Conv variant of :meth:`set_ssm_track_state`.
         """
@@ -325,7 +319,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             new_conv_full_list[0],
             track_indices,
             (track_indices == 0) | (track_mask == 0),
-            new_conv_packed,
+            new_conv,
         )
         return [jax.lax.optimization_barrier(new_full)] + list(new_conv_full_list[1:])
 
@@ -541,7 +535,6 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             "(RecurrentStatePool(spec_num_draft_tokens=...))"
         )
         conv_full, spec_conv_full, spec_ssm_full = conv_list
-        assert conv_full.ndim == 5, "TARGET_VERIFY needs the tiled conv layout (conv_tiled)"
         bs = recurrent_indices.shape[0]
         T = q.shape[0] // bs
         assert T * bs == q.shape[0], (q.shape, bs)
@@ -601,7 +594,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 P(None, None, "tensor", None),  # A_log [1, 1, H, 1]
                 P("tensor"),  # dt_bias [H*K]
                 *cw_specs,  # conv taps
-                P("data", None, None, "tensor", None),  # conv pool (tiled)
+                _CONV_POOL_SPEC,
                 P("data", "tensor", None, None),  # ssm pool
                 P("data"),  # slot indices
                 spec_ssm_spec,
@@ -647,25 +640,6 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         else:
             out = lower_bound * jax.nn.sigmoid(a_scale * g32)
         return out.astype(orig_dtype)
-
-    def _unpack_conv_states(
-        self,
-        conv_states: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Slice ``[B, proj_size, K-1]`` into per-stream Q/K/V caches."""
-        D = conv_states.shape[1]
-        assert D % 3 == 0, f"conv_states channel dim {D} must be divisible by 3"
-        q, k, v = jnp.split(conv_states, 3, axis=1)
-        return q, k, v
-
-    def _pack_conv_states(
-        self,
-        q_state: jax.Array,
-        k_state: jax.Array,
-        v_state: jax.Array,
-    ) -> jax.Array:
-        """Concat per-stream ``[B, D, K-1]`` caches → packed ``[B, proj_size, K-1]``."""
-        return jnp.concatenate([q_state, k_state, v_state], axis=1)
 
 
 __all__ = ["KDAAttnBackend"]

@@ -16,7 +16,12 @@ from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.common_utils import pad_to_bucket
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
-from sgl_jax.test.test_utils import CustomTestCase, KDAAttnBackendForTest
+from sgl_jax.test.test_utils import (
+    CustomTestCase,
+    KDAAttnBackendForTest,
+    kda_conv_from_tiled,
+    kda_conv_to_tiled,
+)
 
 
 def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.ndarray:
@@ -237,6 +242,7 @@ def create_test_data(
         data_partition_axis="data",
         temporal_dtype=jnp.float32,
         conv_dtype=dtype,
+        conv_tiled=True,
     )
     slots_per_rank = pool.slots_per_rank  # valid slots per rank (excl. dummy)
     rank_stride = slots_per_rank + 1  # +1 dummy at index 0 per rank
@@ -386,7 +392,8 @@ def create_test_data(
         jnp.asarray(ssm_init_full_dev, dtype=pool.temporal_dtype), pool.recurrent_sharding
     )
     conv_init_dev = jax.device_put(
-        jnp.asarray(conv_init_full_dev, dtype=pool.conv_dtype), pool.conv_sharding
+        kda_conv_to_tiled(jnp.asarray(conv_init_full_dev, dtype=pool.conv_dtype), head_dim),
+        pool.conv_sharding,
     )
     pool.replace_buffer(([ssm_init_dev], [[conv_init_dev]]))
 
@@ -546,7 +553,7 @@ def assert_pool_state_per_rank(
     err_prefix: str,
 ):
     rec_np = np.asarray(rec_buf)
-    conv_np = np.asarray(conv_buf)
+    conv_np = np.asarray(kda_conv_from_tiled(np.asarray(conv_buf)))
     rank_stride = rec_np.shape[0] // dp_size
     for dp_rank in range(dp_size):
         info = per_dp_infos[dp_rank]

@@ -128,7 +128,7 @@ def _local_or_hf(repo: str) -> str:
     if repo not in _LOCAL_MODEL_LOG_ONCE:
         _LOCAL_MODEL_LOG_ONCE.add(repo)
         print(
-            f"[test_utils] cache miss for {repo} under {cache}, " f"falling back to HF download",
+            f"[test_utils] cache miss for {repo} under {cache}, falling back to HF download",
             file=sys.stderr,
             flush=True,
         )
@@ -235,9 +235,9 @@ def fill_unspecified_parallelism(parallelism: Sequence[int], num_devices: int) -
     assert parallelism.count(-1) == 1, "At most one axis can be unspecified."
     unspecified_axis_idx = parallelism.index(-1)
     determined_val = num_devices / np.prod(parallelism) * -1
-    assert (
-        determined_val >= 1 and determined_val.is_integer
-    ), "Unspecified value unable to be determined with the given parallelism values"
+    assert determined_val >= 1 and determined_val.is_integer, (
+        "Unspecified value unable to be determined with the given parallelism values"
+    )
     parallelism[unspecified_axis_idx] = int(determined_val)
     return parallelism
 
@@ -835,3 +835,20 @@ class GDNAttnBackendForTest(KDAAttnBackendForTest):
     and to make ``test_gdn_attention*.py`` self-contained without leaking
     KDA-specific imports.
     """
+
+
+def kda_conv_to_tiled(conv, head_dim):
+    """Logical KDA conv state [B, 3*H*D, K-1] ([q|k|v] on channels) -> the pool's tiled
+    [B, K-1, 3, H, D]."""
+    import jax.numpy as jnp
+
+    B, proj, km1 = conv.shape
+    return jnp.swapaxes(conv, 1, 2).reshape(B, km1, 3, proj // (3 * head_dim), head_dim)
+
+
+def kda_conv_from_tiled(conv):
+    """Inverse of :func:`kda_conv_to_tiled`."""
+    import jax.numpy as jnp
+
+    B, km1 = conv.shape[:2]
+    return jnp.swapaxes(conv.reshape(B, km1, -1), 1, 2)
