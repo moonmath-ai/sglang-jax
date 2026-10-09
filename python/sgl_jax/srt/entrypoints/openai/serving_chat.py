@@ -132,18 +132,10 @@ class OpenAIServingChat(OpenAIServingBase):
             parser = FunctionCallParser(request.tools, tool_call_parser)
             tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
 
-        # OpenAI-style reasoning_effort reaches the chat template as a template variable
-        # (GLM-5.3 reads reasoning_effort in {low, high} and defaults to Max; Qwen3-style
-        # templates read enable_thinking). "none"/"minimal" ask for the least thinking.
-        # Explicit chat_template_kwargs win.
         if request.reasoning_effort is not None:
-            if request.chat_template_kwargs is None:
-                request.chat_template_kwargs = {}
-            effort = request.reasoning_effort
-            if effort in ("none", "minimal"):
-                request.chat_template_kwargs.setdefault("enable_thinking", False)
-                effort = "low"
-            request.chat_template_kwargs.setdefault("reasoning_effort", effort)
+            request.chat_template_kwargs = _apply_reasoning_effort(
+                request.reasoning_effort, request.chat_template_kwargs
+            )
 
         # Structural_tag grammars block special tokens like <think>.
         # Disable thinking so the template injects an empty <think></think>
@@ -1023,3 +1015,26 @@ def _reconcile_final_tool_args(detector, calls) -> None:
     for c in mine:
         c.parameters = ""
     mine[-1].parameters = remaining
+
+
+# OpenAI reasoning_effort -> chat-template reasoning_effort. GLM-5.3's template only
+# understands {low, high} and defaults to Max for anything else, so pass-through would give
+# "medium" more thinking than "high".
+_REASONING_EFFORT_TO_TEMPLATE = {
+    "none": "low",
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+}
+
+
+def _apply_reasoning_effort(effort: str, chat_template_kwargs: dict | None) -> dict:
+    """Return chat_template_kwargs with the template variables for an OpenAI-style
+    reasoning_effort. "none"/"minimal" also set enable_thinking=False (Qwen3-style templates).
+    Explicit chat_template_kwargs win."""
+    kwargs = dict(chat_template_kwargs or {})
+    if effort in ("none", "minimal"):
+        kwargs.setdefault("enable_thinking", False)
+    kwargs.setdefault("reasoning_effort", _REASONING_EFFORT_TO_TEMPLATE[effort])
+    return kwargs

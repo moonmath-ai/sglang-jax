@@ -435,8 +435,8 @@ class ChatCompletionRequest(BaseModel):
     session_params: dict | None = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
-    # OpenAI-style thinking control, forwarded to the chat template (see serving_chat).
-    reasoning_effort: str | None = None
+    # OpenAI-style thinking control, mapped onto chat template variables (see serving_chat).
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] | None = None
     chat_template_kwargs: dict | None = None
 
     # For request id

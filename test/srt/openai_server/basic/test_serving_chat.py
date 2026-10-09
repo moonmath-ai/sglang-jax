@@ -12,12 +12,16 @@ from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
+from pydantic import ValidationError
 
 from sgl_jax.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
 )
-from sgl_jax.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sgl_jax.srt.entrypoints.openai.serving_chat import (
+    OpenAIServingChat,
+    _apply_reasoning_effort,
+)
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
 
 
@@ -359,6 +363,29 @@ class ServingChatTestCase(unittest.TestCase):
 
         # Should return None since there's no parser data
         self.assertIsNone(result, "Should return None when parser has no tool call data")
+
+
+class ReasoningEffortTestCase(unittest.TestCase):
+    def test_maps_onto_template_low_high(self):
+        expected = {"none": "low", "minimal": "low", "low": "low", "medium": "high", "high": "high"}
+        for effort, template_effort in expected.items():
+            kwargs = _apply_reasoning_effort(effort, None)
+            self.assertEqual(kwargs["reasoning_effort"], template_effort, effort)
+            self.assertEqual("enable_thinking" in kwargs, effort in ("none", "minimal"), effort)
+        self.assertIs(_apply_reasoning_effort("none", None)["enable_thinking"], False)
+
+    def test_explicit_chat_template_kwargs_win(self):
+        explicit = {"reasoning_effort": "max", "enable_thinking": True, "other": 1}
+        kwargs = _apply_reasoning_effort("none", explicit)
+        self.assertEqual(kwargs, explicit)
+        self.assertIsNot(kwargs, explicit)
+
+    def test_protocol_rejects_unknown_effort(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        req = ChatCompletionRequest(model="x", messages=msgs, reasoning_effort="medium")
+        self.assertEqual(req.reasoning_effort, "medium")
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(model="x", messages=msgs, reasoning_effort="max")
 
 
 if __name__ == "__main__":
