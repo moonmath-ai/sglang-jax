@@ -859,9 +859,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 skip_offset=getattr(cfg, "index_skip_topk_offset", 0),
                 full_slot=full_slot,
                 index_kpool=self.dsa_index_kpool,
+                # Static bound on a sequence's pages: the context length (--max-seq-len is a
+                # padding hint and defaults below it), plus the speculative chain.
                 max_pages_per_seq=-(
                     -(
-                        self.server_args.max_seq_len
+                        self.model_config.context_len
                         + (self.server_args.speculative_num_draft_tokens or 0)
                     )
                     // self.page_size
