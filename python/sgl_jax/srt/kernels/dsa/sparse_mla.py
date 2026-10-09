@@ -70,10 +70,11 @@ def compute_topk_pages(
 
 
 def page_mask_to_list(mask: jax.Array, width: int) -> tuple[jax.Array, jax.Array]:
-    """``[N, P]`` hit mask -> (ascending hit pages ``[N, width]`` (-1 padded), count ``[N]``).
+    """``[N, P]`` hit mask -> (lowest ``width`` hit pages ascending ``[N, width]`` (-1 padded),
+    their count ``[N]``).
 
     A ``P``-wide sort of page ids (``P`` = pages per sequence) replaces sorting the
-    selected tokens/pages themselves; exact when ``P <= width``.
+    selected tokens/pages themselves.
     """
     P = mask.shape[-1]
     big = jnp.iinfo(jnp.int32).max
@@ -82,7 +83,7 @@ def page_mask_to_list(mask: jax.Array, width: int) -> tuple[jax.Array, jax.Array
     hits = jnp.where(hits < big, hits, -1)
     if width > P:
         hits = jnp.pad(hits, ((0, 0), (0, width - P)), constant_values=-1)
-    return hits[:, :width], jnp.sum(mask, axis=-1).astype(jnp.int32)
+    return hits[:, :width], jnp.minimum(jnp.sum(mask, axis=-1), width).astype(jnp.int32)
 
 
 def pages_to_mask(page_ids: jax.Array, num_pages: int) -> jax.Array:
@@ -183,12 +184,20 @@ def sparse_mla_page_level(
     new_page_local = new_abs // page_size
     new_off = new_abs % page_size
 
+    def hit_list(page_ids, num_pages):
+        # Ascending unique pages of page_ids (-1 = none) minus the new-token page, which
+        # the sp_local layout below re-appends after hit_pages[:n_hit_c].
+        mask = pages_to_mask(page_ids, num_pages)
+        mask &= jnp.arange(num_pages)[None, :] != new_page_local[:, None]
+        return page_mask_to_list(mask, k_pages_max - 1)
+
     if topk_pages is not None:
         # Precomputed by the indexer (shared across the 4-layer IndexShare
-        # group), so this branch skips the ~0.25ms one_hot+top_k per layer.
-        # Compact valid entries to the front via sort — new_page may sit in
-        # the middle of topk_pages (compute_topk_pages doesn't know it), and
-        # the sp_local layout below assumes hit_pages[:n_hit_c] are all valid.
+        # group), so this branch skips the per-layer page mask over all k
+        # selected tokens. Valid entries are still compacted to the front —
+        # new_page may sit in the middle of topk_pages (compute_topk_pages
+        # doesn't know it), and the sp_local layout below assumes
+        # hit_pages[:n_hit_c] are all valid.
         raw = topk_pages[..., : k_pages_max - 1]
         mp = pages_per_seq if mask_pages is None else min(mask_pages, pages_per_seq)
 
@@ -202,25 +211,14 @@ def sparse_mla_page_level(
             # Hit mask over the sequence's pages + an mp-wide compaction instead of
             # sorting the (k_pages_max-1)-wide page list. Runtime guard: a sequence
             # longer than mp pages takes the sort path.
-            def _masked():
-                mask = pages_to_mask(raw, mp)
-                mask &= jnp.arange(mp)[None, :] != new_page_local[:, None]
-                return page_mask_to_list(mask, k_pages_max - 1)
-
             fits = jnp.max((kv_lens + page_size - 1) // page_size) <= mp
-            hit_pages, n_hit_c = jax.lax.cond(fits, _masked, _sorted)
+            hit_pages, n_hit_c = jax.lax.cond(fits, lambda: hit_list(raw, mp), _sorted)
         else:
             hit_pages, n_hit_c = _sorted()
     else:
-        # Unique pages via one-hot OR over the k topk positions (page count is
+        # Unique pages via a page mask over the k topk positions (page count is
         # bounded by pages_per_seq which is static). Keeps everything jit-static.
-        page_hits = jax.nn.one_hot(page_local, pages_per_seq, dtype=jnp.int32)
-        page_hits = jnp.where(valid[..., None], page_hits, 0)
-        page_mask = jnp.any(page_hits, axis=1)  # [T, P] bool
-        page_mask = page_mask & (jnp.arange(pages_per_seq)[None, :] != new_page_local[:, None])
-        n_hit = jnp.sum(page_mask, axis=-1)
-        _, hit_pages = jax.lax.top_k(page_mask.astype(jnp.int32), k_pages_max - 1)
-        n_hit_c = jnp.minimum(n_hit, k_pages_max - 1)
+        hit_pages, n_hit_c = hit_list(jnp.where(valid, page_local, -1), pages_per_seq)
     n_used = n_hit_c + 1  # +1 for the new-token page
 
     # Layout: [hit_pages[0..n_hit_c-1], new_page, pad...] so the kernel's

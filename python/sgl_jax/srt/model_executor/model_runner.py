@@ -852,6 +852,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     sa.chunked_prefill_size,
                     _index_topk,
                 )
+            # Static bound on a sequence's pages for the sort-free page masks: the context
+            # length (--max-seq-len is a padding hint and defaults below it) plus the
+            # speculative chain, with one page of headroom. Longer sequences stay correct (a
+            # runtime guard takes the sort path); the bound only sets the mask width.
+            max_seq_tokens = self.model_config.context_len + (
+                self.server_args.speculative_num_draft_tokens or 0
+            )
             full_attn_backend = DSASparseAttentionBackend(
                 index_topk=_index_topk,
                 index_head_dim=cfg.index_head_dim,
@@ -859,16 +866,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 skip_offset=getattr(cfg, "index_skip_topk_offset", 0),
                 full_slot=full_slot,
                 index_kpool=self.dsa_index_kpool,
-                # Static bound on a sequence's pages: the context length (--max-seq-len is a
-                # padding hint and defaults below it), plus the speculative chain.
-                max_pages_per_seq=-(
-                    -(
-                        self.model_config.context_len
-                        + (self.server_args.speculative_num_draft_tokens or 0)
-                    )
-                    // self.page_size
-                )
-                + 1,
+                max_pages_per_seq=-(-max_seq_tokens // self.page_size) + 1,
                 num_attn_heads=self.num_attn_heads,
                 kv_lora_rank=cfg.kv_lora_rank,
                 qk_nope_head_dim=cfg.qk_nope_head_dim,
