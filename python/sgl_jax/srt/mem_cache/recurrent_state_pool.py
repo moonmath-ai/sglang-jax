@@ -96,6 +96,7 @@ class RecurrentStatePool:
         spec_num_draft_tokens: int = 0,
         conv_tiled: bool = False,
         lazy_commit: bool = False,
+        spec_rows: int | None = None,
     ):
         """`size` is the **global** number of valid slots across all DP ranks
         (mirrors MHATokenToKVPool.size semantics). Internally we partition by
@@ -115,6 +116,10 @@ class RecurrentStatePool:
         ``[slots, K-1, 3, H, head_dim]`` (taps major, each tap a native [heads, 128] tile;
         spec_conv ``[rows, T, K-1, 3, H, head_dim]``) instead of ``[slots, proj, K-1]``, whose
         minor dim of K-1 forces relayouts around every use.
+
+        ``spec_rows`` (global, divisible by ``dp_size``) bounds the verify batch for the
+        batch-row-indexed scratch; it defaults to ``total_slots``. With the radix cache the pool
+        holds many snapshot slots, so size it by the max running requests instead.
 
         ``lazy_commit`` (KDA conv-fused verify, radix cache off): the verify scratch is indexed
         by **slot** and each layer's conv list gets a 4th entry ``spec_step [slots] int32``:
@@ -191,6 +196,7 @@ class RecurrentStatePool:
         self.spec_num_draft_tokens = spec_num_draft_tokens
         self.conv_tiled = bool(conv_tiled)
         self.lazy_commit = bool(lazy_commit) and spec_num_draft_tokens > 0
+        self.spec_rows = spec_rows
         if self.conv_tiled:
             assert num_k_heads == num_heads and head_k_dim == head_dim, "tiled conv: equal q/k/v"
             self.conv_sharding = NamedSharding(
@@ -202,6 +208,14 @@ class RecurrentStatePool:
             )
 
         self.recurrent_buffers, self.conv_buffers = self._create_buffers(abstract=abstract)
+
+    def _spec_scratch_rows(self) -> int:
+        """Rows of the verify scratch: one per slot for the slot-indexed lazy commit, else the
+        verify batch bound (``spec_rows``)."""
+        if self.lazy_commit or self.spec_rows is None:
+            return self.total_slots
+        assert self.spec_rows % self.dp_size == 0, (self.spec_rows, self.dp_size)
+        return self.spec_rows
 
     def _create_buffers(self, *, abstract: bool = False) -> tuple[list, list]:
         recurrent_shape = (self.total_slots, self.num_heads, self.head_dim, self.head_dim)
@@ -224,12 +238,12 @@ class RecurrentStatePool:
                 T = self.spec_num_draft_tokens
                 conv_inner += [
                     jax.ShapeDtypeStruct(
-                        (self.total_slots, T) + conv_shape[1:],
+                        (self._spec_scratch_rows(), T) + conv_shape[1:],
                         conv_dtype,
                         sharding=self.spec_conv_sharding,
                     ),
                     jax.ShapeDtypeStruct(
-                        (self.total_slots, T) + recurrent_shape[1:],
+                        (self._spec_scratch_rows(), T) + recurrent_shape[1:],
                         temporal_dtype,
                         sharding=self.spec_recurrent_sharding,
                     ),
@@ -262,10 +276,12 @@ class RecurrentStatePool:
             if self.spec_num_draft_tokens > 0:
                 T = self.spec_num_draft_tokens
                 alloc_spec_conv = _get_recurrent_zero_allocator(
-                    (self.total_slots, T) + conv_shape[1:], conv_dtype, self.spec_conv_sharding
+                    (self._spec_scratch_rows(), T) + conv_shape[1:],
+                    conv_dtype,
+                    self.spec_conv_sharding,
                 )
                 alloc_spec_ssm = _get_recurrent_zero_allocator(
-                    (self.total_slots, T) + recurrent_shape[1:],
+                    (self._spec_scratch_rows(), T) + recurrent_shape[1:],
                     temporal_dtype,
                     self.spec_recurrent_sharding,
                 )
@@ -437,6 +453,7 @@ class RecurrentStatePool:
             self.spec_num_draft_tokens,
             self.conv_tiled,
             self.lazy_commit,
+            self.spec_rows,
         )
         return children, aux
 
@@ -463,11 +480,13 @@ class RecurrentStatePool:
             spec_num_draft_tokens,
             conv_tiled,
             lazy_commit,
+            spec_rows,
         ) = aux_data
         obj = cls.__new__(cls)
         obj.spec_num_draft_tokens = spec_num_draft_tokens
         obj.conv_tiled = conv_tiled
         obj.lazy_commit = lazy_commit
+        obj.spec_rows = spec_rows
         obj.linear_recurrent_layer_ids = list(linear_recurrent_layer_ids_tup)
         obj.layers_mapping = {
             layer_id: idx for idx, layer_id in enumerate(obj.linear_recurrent_layer_ids)

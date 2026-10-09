@@ -26,7 +26,7 @@ H, D, K, T = 2, 16, 4, 4
 HIDDEN = H * D
 
 
-def _pool(mesh, spec_T, tiled=False, lazy=False):
+def _pool(mesh, spec_T, tiled=False, lazy=False, spec_rows=None):
     return RecurrentStatePool(
         linear_recurrent_layer_ids=[0],
         size=4,
@@ -39,6 +39,7 @@ def _pool(mesh, spec_T, tiled=False, lazy=False):
         spec_num_draft_tokens=spec_T,
         conv_tiled=tiled,
         lazy_commit=lazy,
+        spec_rows=spec_rows,
     )
 
 
@@ -107,7 +108,14 @@ class TestKDASpecVerify(unittest.TestCase):
     def test_verify_matches_sequential_decode_tiled_conv(self):
         self._check(tiled=True)
 
-    def _check(self, tiled):
+    # Batch-row-indexed scratch only needs the verify batch, not one row per pool slot.
+    def test_verify_scratch_sized_by_batch_rows(self):
+        self._check(tiled=False, spec_rows=self.bs)
+
+    def test_verify_scratch_sized_by_batch_rows_tiled_conv(self):
+        self._check(tiled=True, spec_rows=self.bs)
+
+    def _check(self, tiled, spec_rows=None):
         with jax.set_mesh(self.mesh):
             backend = KDAAttnBackend(mesh=self.mesh)
 
@@ -132,7 +140,7 @@ class TestKDASpecVerify(unittest.TestCase):
             ref_out = np.stack([np.asarray(o) for o in ref_out], axis=1).reshape(self.bs * T, -1)
 
             # Verify: one TARGET_VERIFY forward, running state untouched.
-            pool = _pool(self.mesh, T, tiled=tiled)
+            pool = _pool(self.mesh, T, tiled=tiled, spec_rows=spec_rows)
             self._init(pool)
             conv_of = (lambda c: _to_legacy(c)) if tiled else (lambda c: np.asarray(c))
             backend.forward_metadata = self._meta(np.arange(self.bs + 1, dtype=np.int32) * T)

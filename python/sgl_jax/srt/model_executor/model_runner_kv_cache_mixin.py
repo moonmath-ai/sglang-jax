@@ -286,6 +286,9 @@ def _build_hybrid_pools(
         # Slot-indexed verify scratch, commit = record the accepted step (no state copy).
         # Needs the radix cache off: slot copies / tracks would read a stale pool row.
         lazy_commit=conv_tiled and radix_cache_disabled,
+        # Batch-row-indexed verify scratch: rows for the largest verify batch (+1 per rank),
+        # not one per pool slot (the radix cache adds many snapshot slots).
+        spec_rows=max_num_reqs + dp_size,
     )
     hybrid_pool = HybridReqToTokenPool(
         size=max_num_reqs,
