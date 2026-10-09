@@ -23,7 +23,6 @@ there for the math and its provenance.
 from __future__ import annotations
 
 import logging
-import os
 
 import jax
 import jax.numpy as jnp
@@ -46,6 +45,7 @@ from sgl_jax.srt.models.glm5_moe import (
     moe_router,
 )
 from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention, kda_attention_mappings
+from sgl_jax.srt.utils.parallel_utils import make_reduce_sharding
 
 logger = logging.getLogger(__name__)
 
@@ -138,26 +138,24 @@ class Glm5NextHC(nnx.Module):
         return out.reshape(*lead, hc * d).astype(streams.dtype)
 
 
-def _prefill_sp_sharding(mesh, forward_batch: ForwardBatch, num_tokens: int):
+def _prefill_sp_sharding(mesh, forward_batch: ForwardBatch, hidden_states: jax.Array):
     """Token sharding for sequence-parallel prefill, or None.
 
     Large EXTEND batches keep the mHC residual streams sharded over tokens across the whole
     mesh: sublayer outputs are reduce-scattered (same bytes as the all-reduce), so mHC mixing
     and norms run on 1/n of the tokens per device instead of redundantly on all of them, and
     the normalized sublayer input is all-gathered for attention / MoE. Decode-sized batches
-    stay replicated (there the extra collective hop costs more than the elementwise work).
-    """
-    from sgl_jax.srt.layers.fused_moe import _GMM_MIN_TOKENS
+    stay replicated (there the extra collective hop costs more than the elementwise work);
+    the size threshold is ``make_reduce_sharding``'s (``should_scatter``).
 
-    n = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
-    if (
-        forward_batch.forward_mode != ForwardMode.EXTEND
-        or num_tokens < _GMM_MIN_TOKENS
-        or num_tokens % n
-        or os.environ.get("SGL_JAX_PREFILL_SP", "1") == "0"
-    ):
+    Always on for this model: it is a measured prefill win for GLM-5.3-Flash, while
+    ``--enable-sequence-parallel`` (what other models gate on) is a store_true flag that
+    defaults to off.
+    """
+    if forward_batch.forward_mode != ForwardMode.EXTEND:
         return None
-    return NamedSharding(mesh, P(("data", "tensor"), None))
+    sharding = make_reduce_sharding(hidden_states, mesh)
+    return sharding if sharding.spec[0] == ("data", "tensor") else None
 
 
 class Glm5NextDecoderLayer(nnx.Module):
@@ -263,15 +261,16 @@ class Glm5NextDecoderLayer(nnx.Module):
         sp=None,
     ):
         """``sp``: token sharding of the residual streams (sequence-parallel prefill, see
-        _prefill_sp_sharding) or None (replicated)."""
-        replicated = NamedSharding(self.mesh, P("data", None)) if sp is not None else None
+        _prefill_sp_sharding) or None (no sequence parallelism)."""
+        # Tokens gathered over 'tensor' (still split over 'data'), as attention / MoE consume them.
+        dp_sharding = NamedSharding(self.mesh, P("data", None)) if sp is not None else None
 
         # ---- attention sublayer ----
         h, hc_state = self.hc_attn.pre(hidden_states)
         h = self.input_layernorm(h)
 
         if sp is not None:
-            h = jax.sharding.reshard(h, replicated)  # attention runs on all tokens
+            h = jax.sharding.reshard(h, dp_sharding)  # attention runs on all tokens
         if self.is_kda:
             attn_out, attn_state = self.self_attn(
                 positions, h, forward_batch, recurrent_state_pool, out_sharding=sp
@@ -309,7 +308,7 @@ class Glm5NextDecoderLayer(nnx.Module):
             )
         else:
             if sp is not None:
-                mlp_out = jax.sharding.reshard(self.mlp(jax.sharding.reshard(h, replicated)), sp)
+                mlp_out = jax.sharding.reshard(self.mlp(jax.sharding.reshard(h, dp_sharding)), sp)
             else:
                 mlp_out = self.mlp(h)
             topk_ids = None
@@ -344,7 +343,7 @@ class Glm5NextModel(nnx.Module):
         hc = self.config.hc_mult
         # mHC keeps hc parallel residual streams: broadcast the embedding across the hc axis.
         hidden_states = jnp.tile(self.embed_tokens(forward_batch.input_ids), (1, hc))
-        sp = _prefill_sp_sharding(self.mesh, forward_batch, hidden_states.shape[0])
+        sp = _prefill_sp_sharding(self.mesh, forward_batch, hidden_states)
         if sp is not None:
             stream_sharding = jax.typeof(hidden_states).sharding
             hidden_states = jax.sharding.reshard(hidden_states, sp)
