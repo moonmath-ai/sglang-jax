@@ -63,6 +63,12 @@ def aot_dispatch_enabled(num_flat_args: int) -> bool:
     return _ENV == "1"
 
 
+DECODE_NO_SC_GATHER_OPTIONS = {
+    "xla_tpu_offload_gather_to_sparsecore": "false",
+    "xla_tpu_offload_all_supported_gathers_to_sparsecore": "false",
+}
+
+
 def decode_no_sc_gather_compiler_options_fn():
     """Temporary XLA workaround for the jax 0.11.1 SparseCore gather-offload
     decode regression on TPU v7x (#1613, jax-ml/jax#40553).
@@ -86,10 +92,7 @@ def decode_no_sc_gather_compiler_options_fn():
     def _compiler_options_fn(dyn_args):
         forward_batch = dyn_args[0]
         if forward_batch.forward_mode.is_decode():
-            return {
-                "xla_tpu_offload_gather_to_sparsecore": "false",
-                "xla_tpu_offload_all_supported_gathers_to_sparsecore": "false",
-            }
+            return DECODE_NO_SC_GATHER_OPTIONS
         return None
 
     return _compiler_options_fn

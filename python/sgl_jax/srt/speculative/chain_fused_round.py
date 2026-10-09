@@ -47,6 +47,10 @@ from sgl_jax.srt.layers.attention.mla_backend import (
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
 from sgl_jax.srt.mem_cache.recurrent_state_pool import _commit_speculative_state
+from sgl_jax.srt.model_executor.aot_dispatch import (
+    DECODE_NO_SC_GATHER_OPTIONS,
+    decode_no_sc_gather_compiler_options_fn,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -63,7 +67,6 @@ from sgl_jax.srt.speculative.spec_utils import (
     SIMULATED_ACCEPTANCE_CONFIG,
     apply_simulated_acceptance,
 )
-from sgl_jax.srt.utils.common_utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +184,7 @@ def _accept_sampling(
 
 
 def _unpack(blob, layout, name):
-    off, shape = layout[name]
+    off, shape = dict(layout)[name]
     n = int(np.prod(shape)) if shape else 1
     x = jax.lax.slice_in_dim(blob, off, off + n)
     return x.reshape(shape) if shape else x[0]
@@ -198,7 +201,6 @@ def _fused_round(
     dr_pools,
     elm,
     int_blob,
-    f32_blob,
     hidden,
     base_key,
     relay,
@@ -219,7 +221,7 @@ def _fused_round(
     rep = NamedSharding(mesh, P())
     data = NamedSharding(mesh, P("data"))
     I = lambda name: _unpack(int_blob, layout, name)  # noqa: E731, E741
-    F = lambda name: _unpack(f32_blob, layout, name)  # noqa: E731
+    F = lambda name: jax.lax.bitcast_convert_type(I(name), jnp.float32)  # noqa: E731
     D = lambda x: jax.sharding.reshard(x, data)  # noqa: E731
 
     valid = I("valid") != 0
@@ -239,8 +241,8 @@ def _fused_round(
         verified_id = I("verified_id")
         first_draft_token = I("first_draft")
     recurrent_indices = I("recurrent_indices")
-    extend_seq_lens = D(I("extend_seq_lens"))
-    extend_logits_indices = D(I("extend_logits_indices"))
+    extend_seq_lens = D(jnp.where(valid, T, 0).astype(jnp.int32))
+    extend_logits_indices = D(jnp.arange(bs, dtype=jnp.int32) * T + T - 1)
     temperatures, top_ps = F("temperatures"), F("top_ps")
     top_ks = I("top_ks")
     is_greedy, use_top_p = I("is_greedy")[0] != 0, I("use_top_p")[0] != 0
@@ -278,9 +280,9 @@ def _fused_round(
         tgt_backend.forward_metadata = HybridLinearAttnBackendMetadata(
             full_attn_metadata=chain_md,
             linear_attn_metadata=LinearRecurrentAttnBackendMetadata(
-                cu_q_lens=D(I("kda_cu_q")),
+                cu_q_lens=D(jnp.arange(bs + 1, dtype=jnp.int32) * T),  # unused by the chain kernel
                 recurrent_indices=D(recurrent_indices),
-                has_initial_state=D(I("has_initial_state")) != 0,
+                has_initial_state=D(jnp.ones(bs, jnp.bool_)),
             ),
         )
     else:
@@ -504,18 +506,15 @@ class ChainFusedRound:
             if sa.enable_recurrent_extra_buffer and not sa.disable_radix_cache
             else 0
         )
+        assert not self.track_interval or self.track_interval > 2 * self.T, (
+            f"recurrent track interval {self.track_interval} must exceed 2x the draft tokens "
+            f"({self.T}): a round snapshots at most one boundary"
+        )
         tgt_backend = spec_worker.target_worker.model_runner.attn_backend
         compiler_options = dict(getattr(tgt_backend, "compiler_options", None) or {})
-        if jax.default_backend() == "tpu" and get_bool_env_var(
-            "SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD"
-        ):
-            # Every forward in the round is decode-shaped (see aot_dispatch).
-            compiler_options.update(
-                {
-                    "xla_tpu_offload_gather_to_sparsecore": "false",
-                    "xla_tpu_offload_all_supported_gathers_to_sparsecore": "false",
-                }
-            )
+        if decode_no_sc_gather_compiler_options_fn() is not None:
+            # Every forward in the round is decode-shaped.
+            compiler_options.update(DECODE_NO_SC_GATHER_OPTIONS)
         compiler_options = compiler_options or None
         # Backends enter the JIT as structure only (empty metadata): per-round metadata is
         # rebuilt in-JIT from the packed upload, so stale host metadata never reaches the
@@ -545,10 +544,7 @@ class ChainFusedRound:
         """[bs, vocab] additive penalty for the verify logits: the batch's presence /
         frequency penalties when any request sets them, else a cached device zeros buffer
         (same shape, so no extra executable and no per-round upload)."""
-        pen = getattr(sampling_info, "linear_penalty", None)
-        orch = getattr(sampling_info, "penalizer_orchestrator", None)
-        if pen is None and orch is not None and orch.is_required:
-            pen = orch.apply()
+        pen = sampling_info.linear_penalty
         if pen is None or getattr(pen, "size", 0) == 0:
             if bs not in self._zero_penalty:
                 self._zero_penalty[bs] = jax.device_put(
@@ -592,8 +588,6 @@ class ChainFusedRound:
 
         layout_arrays = dr_mla.spec_chain_layout(mwb, T)
         valid = layout_arrays["valid"]
-        extend_seq_lens = np.where(valid, T, 0).astype(np.int32)
-        extend_logits_indices = (np.arange(bs, dtype=np.int32) * T + T - 1).astype(np.int32)
         recurrent_indices = mwb.recurrent_indices
         if recurrent_indices is None:
             recurrent_indices = np.zeros(bs, np.int32)
@@ -626,12 +620,10 @@ class ChainFusedRound:
             ("step_cu_kv", s_cu_kv),
             ("step_pi", s_pi),
             ("step_dist", s_dist),
-            ("kda_cu_q", np.arange(bs + 1, dtype=np.int32) * T),  # unused by the chain kernel
             ("recurrent_indices", np.asarray(recurrent_indices, np.int32)),
-            ("has_initial_state", np.ones(bs, np.int32)),
-            ("extend_seq_lens", extend_seq_lens),
-            ("extend_logits_indices", extend_logits_indices),
             ("top_ks", top_ks),
+            ("temperatures", temperatures.view(np.int32)),
+            ("top_ps", top_ps.view(np.int32)),
             ("is_greedy", np.asarray([int(is_greedy)], np.int32)),
             ("use_top_p", np.asarray([int(use_top_p)], np.int32)),
             ("round_id", np.asarray([self._round_id], np.int32)),
@@ -656,14 +648,9 @@ class ChainFusedRound:
                 ("first_draft", np.asarray(spec.topk_index, np.int32).reshape(bs, -1)[:, 0]),
             ]
             hidden = spec.hidden_states
-            if not isinstance(hidden, jax.Array):
-                hidden = np.asarray(hidden)
             relay = None
-        named_f32 = [("temperatures", temperatures), ("top_ps", top_ps)]
-        int_blob, int_layout = _pack(named_int, np.int32)
-        f32_blob, f32_layout = _pack(named_f32, np.float32)
-        layout_key = tuple(sorted({**int_layout, **f32_layout}.items()))
-        int_dev, f32_dev, hidden = jax.device_put((int_blob, f32_blob, hidden), rep)
+        int_blob, layout = _pack(named_int)
+        int_dev, hidden = jax.device_put((int_blob, hidden), rep)
 
         with jax.set_mesh(self.mesh):
             tgt_updates, dr_updates, outs, new_relay = self._jit(
@@ -677,12 +664,11 @@ class ChainFusedRound:
                 dmr.memory_pools,
                 get_global_expert_location_metadata(),
                 int_dev,
-                f32_dev,
                 hidden,
                 self._key,
                 relay,
                 penalty,
-                layout=_Layout(layout_key),
+                layout=layout,
                 steps=steps,
                 T=T,
                 bs=bs,
@@ -791,35 +777,16 @@ def _publish_relay(relay, future, valid, topk, hidden, vid, new_seq):
     )
 
 
-class _Layout:
-    """Static, hashable blob layout: name -> (offset, shape)."""
-
-    def __init__(self, items):
-        self._items = items
-        self._d = dict(items)
-
-    def __getitem__(self, name):
-        return self._d[name]
-
-    def __contains__(self, name):
-        return name in self._d
-
-    def __hash__(self):
-        return hash(self._items)
-
-    def __eq__(self, other):
-        return isinstance(other, _Layout) and self._items == other._items
-
-
-def _pack(named, dtype):
-    """Concatenate host arrays into one flat buffer; layout maps name -> (offset, shape)."""
-    layout, parts, off = {}, [], 0
+def _pack(named):
+    """Concatenate int32 host arrays into one flat buffer; the layout is a static, hashable
+    tuple of (name, (offset, shape))."""
+    layout, parts, off = [], [], 0
     for name, arr in named:
-        arr = np.asarray(arr).astype(dtype, copy=False)
-        layout[name] = (off, tuple(arr.shape))
+        arr = np.asarray(arr).astype(np.int32, copy=False)
+        layout.append((name, (off, tuple(arr.shape))))
         parts.append(arr.reshape(-1))
         off += arr.size
-    return (np.concatenate(parts) if parts else np.zeros((0,), dtype)), layout
+    return np.concatenate(parts), tuple(layout)
 
 
 def _empty_backend_treedef(backend):
