@@ -7,7 +7,6 @@ This file implements python APIs for the inference engine.
 import asyncio
 import atexit
 import dataclasses
-import json
 import logging
 import multiprocessing as mp
 import os
@@ -33,7 +32,7 @@ from sgl_jax.utils import traverse_and_update
 threading._register_atexit = lambda *args, **kwargs: None
 
 from sgl_jax.srt.entrypoints.EngineBase import EngineBase
-from sgl_jax.srt.hf_transformers_utils import get_generation_config
+from sgl_jax.srt.hf_transformers_utils import get_model_sampling_defaults
 from sgl_jax.srt.managers.detokenizer_manager import (
     run_detokenizer_process,
     run_detokenizer_thread,
@@ -496,39 +495,7 @@ class Engine(EngineBase):
 
     def get_default_sampling_params(self) -> SamplingParams:
         if self.default_sampling_params is None:
-            config = get_generation_config(
-                self.server_args.model_path,
-                self.server_args.trust_remote_code,
-                self.server_args.revision,
-            )
-            if config is not None:
-                self.default_sampling_params = config.to_diff_dict()
-            else:
-                self.default_sampling_params = {}
-
-            if self.server_args.preferred_sampling_params is not None:
-                self.default_sampling_params.update(
-                    json.loads(self.server_args.preferred_sampling_params)
-                )
-
-            available_params = [
-                "repetition_penalty",
-                "temperature",
-                "top_k",
-                "top_p",
-                "min_p",
-                "max_new_tokens",
-            ]
-            if any(p in self.default_sampling_params for p in available_params):
-                diff_sampling_param = {
-                    p: self.default_sampling_params.get(p)
-                    for p in available_params
-                    if self.default_sampling_params.get(p) is not None
-                }
-                self.default_sampling_params = diff_sampling_param
-
-            else:
-                self.default_sampling_params = {}
+            self.default_sampling_params = get_model_sampling_defaults(self.server_args)
 
         if self.default_sampling_params:
             return SamplingParams(**self.default_sampling_params)

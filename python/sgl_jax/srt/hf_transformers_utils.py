@@ -159,6 +159,32 @@ def get_generation_config(
         return None
 
 
+# Sampling fields a model's generation_config / --preferred-sampling-params may default.
+MODEL_DEFAULT_SAMPLING_FIELDS = (
+    "repetition_penalty",
+    "temperature",
+    "top_k",
+    "top_p",
+    "min_p",
+    "max_new_tokens",
+)
+
+
+def get_model_sampling_defaults(server_args) -> dict:
+    """Model-recommended sampling values: the model's generation_config (local dir or hub
+    id, at --revision; the same cached load ModelConfig uses), then
+    --preferred-sampling-params on top. Only MODEL_DEFAULT_SAMPLING_FIELDS, None dropped."""
+    config = get_generation_config(
+        server_args.model_path, server_args.trust_remote_code, server_args.revision
+    )
+    # transformers 5.x GenerationConfig defaults are None, so to_diff_dict() keeps every
+    # value the file sets (including temperature=1.0).
+    defaults = config.to_diff_dict() if config is not None else {}
+    if server_args.preferred_sampling_params:
+        defaults.update(json.loads(server_args.preferred_sampling_params))
+    return {k: defaults[k] for k in MODEL_DEFAULT_SAMPLING_FIELDS if defaults.get(k) is not None}
+
+
 # Models don't use the same configuration key for determining the maximum
 # context length.  Store them here so we can sanely check them.
 # NOTE: The ordering here is important. Some models have two of these and we

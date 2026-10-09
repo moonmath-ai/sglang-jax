@@ -30,7 +30,9 @@ class _MockTokenizerManager:
             enable_cache_report=False,
             tool_call_parser="hermes",
             reasoning_parser=None,
-            model_path="",
+            model_path="/nonexistent/sgl-jax-test-model",
+            trust_remote_code=False,
+            revision=None,
             preferred_sampling_params=None,
         )
         self.chat_template_name: Optional[str] = "llama-3"

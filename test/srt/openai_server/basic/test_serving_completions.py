@@ -39,7 +39,11 @@ class ServingCompletionTestCase(unittest.TestCase):
 
         tm.model_config = Mock(is_multimodal=False)
         tm.server_args = Mock(
-            enable_cache_report=False, model_path="", preferred_sampling_params=None
+            enable_cache_report=False,
+            model_path="/nonexistent/sgl-jax-test-model",
+            trust_remote_code=False,
+            revision=None,
+            preferred_sampling_params=None,
         )
 
         tm.generate_request = AsyncMock()

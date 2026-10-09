@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 import uuid
 from abc import ABC, abstractmethod
 from typing import Any
@@ -9,33 +8,15 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sgl_jax.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sgl_jax.srt.hf_transformers_utils import get_model_sampling_defaults
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
 
 
-# Sampling fields a request may leave to the model's generation_config.json.
+# Sampling fields an OpenAI request may leave to the model's defaults.
 _MODEL_DEFAULT_SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "min_p")
-
-
-def load_model_sampling_defaults(model_path: str, preferred_json: str | None) -> dict[str, Any]:
-    """Model-recommended sampling values: generation_config.json (read as written, since
-    transformers' GenerationConfig hides values equal to its own defaults, e.g.
-    temperature 1.0), then --preferred-sampling-params on top."""
-    defaults: dict[str, Any] = {}
-    path = os.path.join(model_path, "generation_config.json")
-    if os.path.isfile(path):
-        try:
-            with open(path) as f:
-                cfg = json.load(f)
-            defaults = {k: cfg[k] for k in _MODEL_DEFAULT_SAMPLING_FIELDS if cfg.get(k) is not None}
-        except (OSError, ValueError) as e:
-            logger.warning("Ignoring unreadable %s: %s", path, e)
-    if preferred_json:
-        preferred = json.loads(preferred_json)
-        defaults.update({k: v for k, v in preferred.items() if k in _MODEL_DEFAULT_SAMPLING_FIELDS})
-    return defaults
 
 
 # Base class for specific endpoint handlers
@@ -50,10 +31,8 @@ class OpenAIServingBase(ABC):
         (upstream sglang's model sampling defaults) instead of the protocol defaults."""
         defaults = getattr(self, "_model_sampling_defaults", None)
         if defaults is None:
-            args = self.tokenizer_manager.server_args
-            defaults = load_model_sampling_defaults(
-                args.model_path, getattr(args, "preferred_sampling_params", None)
-            )
+            defaults = get_model_sampling_defaults(self.tokenizer_manager.server_args)
+            defaults = {k: v for k, v in defaults.items() if k in _MODEL_DEFAULT_SAMPLING_FIELDS}
             self._model_sampling_defaults = defaults
         for key, value in defaults.items():
             if key not in request.model_fields_set:
