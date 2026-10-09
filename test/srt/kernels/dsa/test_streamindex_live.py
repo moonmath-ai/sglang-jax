@@ -87,6 +87,22 @@ def test_bucket_crossings_and_packed_page_offsets():
         np.testing.assert_array_equal(inputs[2], host[2])
 
 
+@pytest.mark.parametrize(
+    "lengths, active",
+    [
+        # > 4 active rows: one pass at the longest bucket, rows padded to blocks of 4.
+        ([2047, 129, 8320, 4097, 1, 650, 0, 2049, 8191], 9),
+        ([100, 4096, 300, 5000, 2048, 129, 8193, 7], 7),  # trailing inactive row
+        # <= 4 active rows in a larger batch: grouped loop.
+        ([100, 4096, 0, 5000, 8193, 129, 2049, 7], 5),
+    ],
+)
+def test_single_pass_and_grouped_dispatch(lengths, active):
+    host = make_inputs(lengths, active=active)
+    actual = streamindex_topk_live(*map(jnp.asarray, host), k=K, pages_per_seq=65)
+    verify(host, actual)
+
+
 @pytest.mark.parametrize("weight", [0.0, -1.0])
 def test_ties_negative_scores_and_inactive_rows(weight):
     host = list(make_inputs([128, 1, 128], capacity=1, active=2))
