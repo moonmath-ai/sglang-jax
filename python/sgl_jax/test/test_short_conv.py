@@ -122,11 +122,12 @@ class ShortConvolutionTest(CustomTestCase):
     # EXTEND mode
     # ------------------------------------------------------------------
 
-    def _run_extend_case(self, seq_lens, hidden, kernel, has_prior_cache):
+    def _run_extend_case(self, seq_lens, hidden, kernel, has_prior_cache, pad=0):
+        """``pad``: trailing padded tokens beyond ``cu_seqlens[-1]`` (output ignored)."""
         total = sum(seq_lens)
         cu_seqlens = jnp.asarray(np.concatenate([[0], np.cumsum(seq_lens)]), dtype=jnp.int32)
         x = jnp.asarray(
-            self.rng.standard_normal((total, hidden)).astype(np.float32),
+            self.rng.standard_normal((total + pad, hidden)).astype(np.float32),
             dtype=self.dtype,
         )
         weight = _make_weight(self.rng, hidden, kernel, self.dtype)
@@ -151,7 +152,7 @@ class ShortConvolutionTest(CustomTestCase):
             bias=None,
             activation="silu",
         )
-        self.assertEqual(y_short.shape, (total, hidden))
+        self.assertEqual(y_short.shape, (total + pad, hidden))
         self.assertEqual(new_cache.shape, (B, hidden, W))
 
         # Baseline: nnx.Conv per sequence with injected history.
@@ -159,7 +160,7 @@ class ShortConvolutionTest(CustomTestCase):
         y_ref = _baseline_extend(x, cu_seqlens, conv, cache)
 
         np.testing.assert_allclose(
-            np.asarray(y_short),
+            np.asarray(y_short)[:total],
             np.asarray(y_ref),
             atol=self.atol,
             rtol=self.rtol,
@@ -201,6 +202,16 @@ class ShortConvolutionTest(CustomTestCase):
 
     def test_extend_kernel_size_2(self):
         self._run_extend_case(seq_lens=[3, 4], hidden=1024, kernel=2, has_prior_cache=True)
+
+    def test_extend_zero_length_sequences(self):
+        # Zero-length (padding) sequences must neither emit rows nor touch their cache.
+        self._run_extend_case(seq_lens=[0, 3, 0, 9, 1], hidden=1024, kernel=4, has_prior_cache=True)
+
+    def test_extend_trailing_padding(self):
+        # Padded tokens past cu_seqlens[-1] must not leak into real rows or the cache.
+        self._run_extend_case(
+            seq_lens=[5, 1, 2, 7], hidden=1024, kernel=4, has_prior_cache=True, pad=5
+        )
 
     # ------------------------------------------------------------------
     # DECODE mode
