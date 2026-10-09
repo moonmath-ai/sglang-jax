@@ -8,10 +8,17 @@ context limit. No short-context shortcut is used: every active query is scored.
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
 
 from sgl_jax.srt.kernels.dsa.streamindex_topk import streamindex_topk
+
+# One bucket per call (the batch's longest live context) and a single kernel launch +
+# selection for all rows, instead of a loop over groups of 4 rows with a bucket switch per
+# group. DSA_INDEXER_SINGLE_PASS=0 restores the grouped loop.
+_SINGLE_PASS = os.environ.get("DSA_INDEXER_SINGLE_PASS", "1") == "1"
 
 
 def _page_buckets(pages_per_seq: int, pages_per_block: int) -> tuple[int, ...]:
@@ -92,6 +99,50 @@ def streamindex_topk_live(
     if batch == 0:
         return jnp.full((0, k), -1, jnp.int32)
 
+    if _SINGLE_PASS:
+        dbs = min(4, batch)
+        padded = -(-batch // dbs) * dbs
+        starts = cu_kv_lens[:batch] // (page_size * compression_ratio)
+        live = (jnp.arange(batch) < distribution[0]) & (seq_lens > 0)
+        lengths = jnp.where(live, seq_lens, 0)
+        qp, wp = q, weights
+        if padded != batch:
+            qp = jnp.pad(q, ((0, padded - batch), (0, 0), (0, 0)))
+            wp = jnp.pad(weights, ((0, padded - batch), (0, 0)))
+            lengths_p = jnp.pad(lengths, ((0, padded - batch),))
+            starts = jnp.pad(starts, ((0, padded - batch),))
+        else:
+            lengths_p = lengths
+        bucket = jnp.minimum(jnp.sum(jnp.max(lengths) > limits, dtype=jnp.int32), len(buckets) - 1)
+        tbl = jnp.concatenate(
+            [page_indices, jnp.full((buckets[-1],), page_indices[-1], page_indices.dtype)]
+        )
+        cuq = jnp.arange(padded + 1, dtype=jnp.int32)
+        dist = jnp.asarray([padded, padded, padded], jnp.int32)
+
+        def _branch(bp):
+            def f(_):
+                pages = tbl[starts[:, None] + jnp.arange(bp, dtype=jnp.int32)[None, :]].reshape(-1)
+                return streamindex_topk(
+                    qp,
+                    wp,
+                    cache4d,
+                    lengths_p,
+                    pages,
+                    cuq,
+                    dist,
+                    k=k,
+                    compression_ratio=compression_ratio,
+                    num_kv_pages_per_block=min(bp, num_kv_pages_per_block),
+                    num_queries_per_block=1,
+                    decode_req_batch_size=dbs,
+                )
+
+            return f
+
+        sel = jax.lax.switch(bucket, [_branch(bp) for bp in buckets], None)[:batch]
+        return jnp.where((lengths > 0)[:, None], sel, -1)
+
     group_size = min(4, batch)
     # Leave one group's lookahead after the real rows: a bucket run can end
     # at any row, so the final partial group still needs a full static slice.
@@ -117,15 +168,21 @@ def streamindex_topk_live(
     # cu_q_lens is an ignored ABI slot (decode: query i belongs to sequence i).
     one_cuq = jnp.arange(group_size + 1, dtype=jnp.int32)
     one_dist = jnp.asarray([group_size, group_size, group_size], jnp.int32)
+    # Pad by the largest window so every row window stays in bounds without shifting (the
+    # old per-element clamp only ever affected pages past a row's live length).
+    padded_pages = jnp.concatenate(
+        [page_indices, jnp.full((buckets[-1],), page_indices[-1], page_indices.dtype)]
+    )
     bucket_branches = []
 
     for bucket_pages in buckets:
 
         def score_and_select(args, bucket_pages=bucket_pages):
             q_group, w_group, lengths_group, starts_group, group_order, out = args
-            offsets = starts_group[:, None] + jnp.arange(bucket_pages, dtype=jnp.int32)[None, :]
-            offsets = jnp.minimum(offsets, page_indices.shape[0] - 1)
-            pages = page_indices[offsets].reshape(-1)
+            # Row windows of the (padded) page table: one gather for the group.
+            pages = padded_pages[
+                starts_group[:, None] + jnp.arange(bucket_pages, dtype=jnp.int32)[None, :]
+            ].reshape(-1)
             selected = streamindex_topk(
                 q_group,
                 w_group,

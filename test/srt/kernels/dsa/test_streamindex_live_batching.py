@@ -36,6 +36,8 @@ def test_bucket_groups_restore_rows_and_packed_page_offsets(monkeypatch):
         return jnp.broadcast_to(first_pages[:, None], (group_size, k))
 
     monkeypatch.setattr(streamindex_live, "streamindex_topk", fake_streamindex_topk)
+    # Exercises the grouped (DSA_INDEXER_SINGLE_PASS=0) path's row grouping and scatter.
+    monkeypatch.setattr(streamindex_live, "_SINGLE_PASS", False)
 
     q = np.zeros((batch, heads, head_dim), ml_dtypes.bfloat16)
     weights = np.zeros((batch, heads), ml_dtypes.bfloat16)
