@@ -108,7 +108,7 @@ class BaseSpecWorker:
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
 
-        # One-JIT decode round for topk=1 chains on MLA-family backends (see
+        # One-JIT decode round for NEXTN topk=1 chains on the DSA backend (see
         # chain_fused_round.py); the generic draft/verify/draft-extend loop stays the fallback.
         self._chain_fused_round = None
         if os.getenv("SGL_JAX_DISABLE_CHAIN_FUSED_ROUND") != "1":
@@ -199,7 +199,7 @@ class BaseSpecWorker:
                 "prefill overlap uses forward_batch_speculative_generation()."
             )
         if self._chain_fused_round is not None:
-            # One-JIT chain round with relay-resident draft state (non-FA backends).
+            # One-JIT chain round with relay-resident draft state.
             self._prepare_overlap_sampling_info(model_worker_batch)
             result = self._chain_fused_round.run(
                 model_worker_batch,
@@ -376,13 +376,7 @@ class BaseSpecWorker:
             if launch_done is not None:
                 launch_done.set()
             return batch_output
-        relay_state = getattr(model_worker_batch.spec_info_padded, "future_indices", None)
-        if self._chain_fused_round is not None and relay_state is not None:
-            # Draft state lives in the relay (overlap schedule), whatever routed us here.
-            return self._chain_fused_round.run(model_worker_batch, cur_allocate_lens, overlap=True)
-        if self._chain_fused_round is not None and self._chain_fused_round.supports_batch(
-            model_worker_batch
-        ):
+        if self._chain_fused_round is not None:
             return self._chain_fused_round.run(model_worker_batch, cur_allocate_lens)
         self.draft_worker.draft(model_worker_batch)
         batch_output = self.verify(model_worker_batch, cur_allocate_lens)

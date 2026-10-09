@@ -1,4 +1,5 @@
-"""Vectorized topk=1 chain target-only sampling == tree_speculative_sampling_target_only.
+"""Vectorized topk=1 chain accept: target-only sampling == tree_speculative_sampling_target_only,
+greedy == the sequential greedy chain rule.
 
     JAX_PLATFORMS=cpu python -m pytest python/sgl_jax/test/speculative/test_chain_fused_sampling.py
 """
@@ -10,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.kernels.speculative.kernel import tree_speculative_sampling_target_only
-from sgl_jax.srt.speculative.chain_fused_round import _accept_sampling
+from sgl_jax.srt.speculative.chain_fused_round import _accept_greedy, _accept_sampling
 from sgl_jax.srt.speculative.eagle_util import build_chain_verify_inputs
 
 
@@ -40,7 +41,6 @@ class TestChainFusedSampling(unittest.TestCase):
                 top_ks,
                 top_ps,
                 key,
-                steps=T - 1,
                 T=T,
                 use_top_p=False,
                 threshold_single=1.0,
@@ -70,6 +70,31 @@ class TestChainFusedSampling(unittest.TestCase):
             np.testing.assert_array_equal(
                 np.asarray(predict)[: bs * T], np.asarray(r_pred)[: bs * T]
             )
+
+    def test_greedy_matches_sequential_rule(self):
+        bs, T, V = 6, 4, 11
+        rng = np.random.default_rng(1)
+        for _ in range(20):
+            logits = rng.standard_normal((bs * T, V)).astype(np.float32)
+            target = logits.argmax(-1).reshape(bs, T)
+            drafts = np.where(
+                rng.random((bs, T - 1)) < 0.7, target[:, :-1], rng.integers(0, V, (bs, T - 1))
+            )
+            cand = np.concatenate([rng.integers(0, V, (bs, 1)), drafts], axis=1)
+            acc_idx, n_acc, predict = _accept_greedy(
+                jnp.asarray(logits), jnp.asarray(cand.reshape(-1), jnp.int32), T=T
+            )
+            for r in range(bs):
+                n = 0
+                while n < T - 1 and cand[r, n + 1] == target[r, n]:
+                    n += 1
+                self.assertEqual(int(n_acc[r]), n)
+                expect_idx = [r * T + k if k <= n else -1 for k in range(T)]
+                np.testing.assert_array_equal(np.asarray(acc_idx[r]), expect_idx)
+                # Accepted drafts, then the target's token at the stop row.
+                np.testing.assert_array_equal(
+                    np.asarray(predict)[r * T : r * T + n + 1], target[r, : n + 1]
+                )
 
 
 if __name__ == "__main__":

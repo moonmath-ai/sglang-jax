@@ -1,4 +1,4 @@
-"""One-JIT speculative decode round for topk=1 chains on non-FlashAttention backends.
+"""One-JIT speculative decode round for NEXTN topk=1 chains on the DSA backend.
 
 The generic EAGLE loop (``EagleDraftWorker.draft`` -> ``BaseSpecWorker.verify`` ->
 ``EagleDraftWorker.draft_extend_for_decode``) issues four model dispatches plus ~60 small
@@ -14,8 +14,8 @@ Every phase's attention metadata is one request-layout page table (host-built fr
 from ``seq_lens``, so the host uploads it once with one ``device_put``. Results come back with one ``device_get``. Outputs match the
 generic loop's ``GenerationBatchResult`` so the scheduler is unchanged.
 
-Scope: NEXTN / EAGLE with one draft model, topk == 1, num_draft_tokens == num_steps + 1,
-dp_size == 1, MLA-family attention on both models, no logprobs.
+Scope (see ``can_use_chain_fused_round``): NEXTN with one full-vocabulary draft model, topk == 1,
+num_draft_tokens == num_steps + 1, dp_size == 1, DSA attention on both models, no logprobs.
 """
 
 from __future__ import annotations
@@ -32,7 +32,6 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.speculative.kernel import top_k_renorm_prob, top_p_renorm_prob
-from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
 from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSASparseAttentionBackend
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -56,7 +55,6 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
-from sgl_jax.srt.speculative.eagle_util import build_chain_verify_inputs_device
 from sgl_jax.srt.speculative.relay_buffer import (
     gather_spec_relay_buffers,
     make_dp_valid_mask,
@@ -106,18 +104,31 @@ def _run_model(model_def, state_def, leaves, forward_batch, pools, logits_metada
     return output, pool_updates
 
 
-def _accept_greedy(
-    logits, draft_tokens, retrive_index, retrive_next_token, retrive_next_sibling, *, steps, T
-):
-    return verify_tree_greedy(
-        speculative_num_steps=steps,
-        num_draft_tokens=T,
-        draft_tokens=draft_tokens,
-        retrive_index=retrive_index,
-        retrive_next_token=retrive_next_token,
-        retrive_next_sibling=retrive_next_sibling,
-        next_token_logits=logits,
-    )
+def _chain_accept(cand, n_acc, bonus):
+    """Accept the first ``n_acc`` draft tokens of each chain and append ``bonus``.
+
+    ``cand`` [bs, T] is the verified chain (bonus token, d_1 .. d_{T-1}). Returns
+    (accept_index [bs, T], accept_length (excl. bonus) [bs], predict [bs*T+1]) with
+    predict[r*T + k] = d_{k+1} for k < n_acc and predict[r*T + n_acc] = bonus.
+    """
+    bs, T = cand.shape
+    j = jnp.arange(T, dtype=jnp.int32)[None, :]
+    base = (jnp.arange(bs, dtype=jnp.int32) * T)[:, None]
+    accept_index = jnp.where(j <= n_acc[:, None], base + j, -1).astype(jnp.int32)
+    nxt = jnp.concatenate([cand[:, 1:], jnp.zeros((bs, 1), cand.dtype)], axis=1)
+    pred = jnp.where(j < n_acc[:, None], nxt, jnp.where(j == n_acc[:, None], bonus[:, None], 0))
+    predict = jnp.concatenate([pred.reshape(-1), jnp.zeros((1,), jnp.int32)]).astype(jnp.int32)
+    return accept_index, n_acc.astype(jnp.int32), predict
+
+
+def _accept_greedy(logits, draft_tokens, *, T):
+    """Greedy chain verify: accept d_j while it equals the target's argmax at j - 1."""
+    cand = draft_tokens.reshape(-1, T)
+    target = jnp.argmax(logits, axis=-1).astype(jnp.int32).reshape(-1, T)
+    ok = target[:, : T - 1] == cand[:, 1:]
+    n_acc = jnp.sum(jnp.cumprod(ok.astype(jnp.int32), axis=1), axis=1)
+    bonus = jnp.take_along_axis(target, n_acc[:, None], axis=1)[:, 0]
+    return _chain_accept(cand, n_acc, bonus)
 
 
 def _accept_sampling(
@@ -128,7 +139,6 @@ def _accept_sampling(
     top_ps,
     key,
     *,
-    steps,
     T,
     use_top_p,
     threshold_single,
@@ -171,15 +181,7 @@ def _accept_sampling(
     )
     cdf = jnp.cumsum(q, axis=-1)
     bonus = jnp.argmax(cdf > (coin_final * cdf[:, -1])[:, None], axis=-1).astype(jnp.int32)
-
-    j = jnp.arange(T, dtype=jnp.int32)[None, :]
-    base = (rows * T)[:, None].astype(jnp.int32)
-    accept_index = jnp.where(j <= n_acc[:, None], base + j, -1).astype(jnp.int32)
-    # predict[r*T + k] = d_{k+1} for k < n_acc, predict[r*T + n_acc] = bonus
-    nxt = jnp.concatenate([cand[:, 1:], jnp.zeros((bs, 1), cand.dtype)], axis=1)
-    pred = jnp.where(j < n_acc[:, None], nxt, jnp.where(j == n_acc[:, None], bonus[:, None], 0))
-    predict = jnp.concatenate([pred.reshape(-1), jnp.zeros((1,), jnp.int32)]).astype(jnp.int32)
-    return accept_index, n_acc, predict
+    return _chain_accept(cand, n_acc, bonus)
 
 
 def _unpack(blob, layout, name):
@@ -261,7 +263,6 @@ def _fused_round(
 
     chain_md = request_md(verified_seq_lens + T, T)
     dr_step_mds = [request_md(seq_lens + i, 1) for i in range(steps - 1)]
-    dr_extend_md = chain_md
 
     tgt_backend = jax.tree_util.tree_unflatten(tgt_backend_def, [])
     if isinstance(tgt_backend, HybridLinearAttnBackend):
@@ -314,12 +315,9 @@ def _fused_round(
     token_list = jnp.stack(tokens, axis=1)  # [bs, steps]
 
     # ---- target verify over [bonus, d1, .., d_{T-1}] ----
-    packed = build_chain_verify_inputs_device(verified_id, token_list, verified_seq_lens, T, bs)
-    packed = jax.sharding.reshard(packed, rep)
-    draft_tokens, positions = packed[0], packed[1]
-    retrive_index = packed[2].reshape(bs, T)
-    retrive_next_token = packed[3].reshape(bs, T)
-    retrive_next_sibling = packed[4].reshape(bs, T)
+    draft_tokens = jnp.concatenate([verified_id[:, None], token_list[:, : T - 1]], axis=1)
+    draft_tokens = draft_tokens.astype(jnp.int32).reshape(-1)
+    positions = (verified_seq_lens[:, None] + jnp.arange(T, dtype=jnp.int32)[None, :]).reshape(-1)
     tgt_fb_verify.input_ids = draft_tokens
     tgt_fb_verify.positions = positions
     lm_verify = LogitsMetadata(
@@ -337,15 +335,7 @@ def _fused_round(
     # One executable per bucket: greedy vs sampling (and top-p) are runtime flags.
     accept_index, accept_length, predict = jax.lax.cond(
         is_greedy,
-        lambda: _accept_greedy(
-            logits,
-            draft_tokens,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            steps=steps,
-            T=T,
-        ),
+        lambda: _accept_greedy(logits, draft_tokens, T=T),
         lambda: _accept_sampling(
             logits,
             draft_tokens,
@@ -353,7 +343,6 @@ def _fused_round(
             top_ks,
             top_ps,
             key,
-            steps=steps,
             T=T,
             use_top_p=use_top_p,
             threshold_single=threshold_single,
@@ -386,7 +375,7 @@ def _fused_round(
     # ---- hybrid target: keep the recurrent state after the accepted prefix ----
     if "recurrent_state_pool" in tgt_pools._pools:
         rsp = tgt_pools.recurrent_state_pool
-        data = NamedSharding(mesh, P(rsp.data_partition_axis))
+        rec_data = NamedSharding(mesh, P(rsp.data_partition_axis))
         track = {}
         if track_interval:
             # Extra-buffer radix cache: snapshot the state at the first track boundary the
@@ -396,16 +385,17 @@ def _fused_round(
             boundary = (verified_seq_lens // track_interval + 1) * track_interval
             crossed = valid & (track_indices != 0) & (boundary <= verified_seq_lens + accept_length)
             track = dict(
-                track_indices=jax.sharding.reshard(track_indices, data),
+                track_indices=jax.sharding.reshard(track_indices, rec_data),
                 track_steps=jax.sharding.reshard(
-                    jnp.where(crossed, boundary - verified_seq_lens - 1, -1).astype(jnp.int32), data
+                    jnp.where(crossed, boundary - verified_seq_lens - 1, -1).astype(jnp.int32),
+                    rec_data,
                 ),
             )
         new_rec, new_conv = _commit_speculative_state(
             rsp.recurrent_buffers,
             rsp.conv_buffers,
-            jax.sharding.reshard(recurrent_indices, data),
-            jax.sharding.reshard(accept_length, data),
+            jax.sharding.reshard(recurrent_indices, rec_data),
+            jax.sharding.reshard(accept_length, rec_data),
             **rsp.commit_static_args(),
             **track,
         )
@@ -423,7 +413,7 @@ def _fused_round(
     new_seq_lens = verified_seq_lens + accept_length + 1
 
     # ---- draft extend over the verified chain ----
-    dr_fb_extend.attn_backend.forward_metadata = dr_extend_md
+    dr_fb_extend.attn_backend.forward_metadata = chain_md
     dr_fb_extend.input_ids = verified_flat
     dr_fb_extend.positions = ext_positions
     dr_fb_extend.spec_info = EagleDraftInput(hidden_states=ext_hidden)
@@ -544,9 +534,6 @@ class ChainFusedRound:
         if pen.shape[0] < bs:
             pen = np.concatenate([pen, np.zeros((bs - pen.shape[0], pen.shape[1]), np.float32)])
         return jax.device_put(pen[:bs], sharding)
-
-    def supports_batch(self, mwb) -> bool:
-        return not (mwb.return_logprob or getattr(mwb, "return_output_logprob_only", False))
 
     def run(self, mwb, cur_allocate_lens, *, overlap: bool = False):
         """One speculative decode round.
