@@ -57,7 +57,7 @@ def _verify_kernel(
     km1 = stc_ref.shape[2]
     f32 = jnp.float32
     ascale = ascale_ref[...]  # [H, 1] exp(A_log)
-    dtb = dtb_ref[...].astype(f32)  # [H, D]
+    dtb = dtb_ref[...]  # [H, D] f32 (cast by the wrapper)
 
     def conv_steps(c, x_ref):
         """Post-conv [H, D] tiles of tensor c for every step (rounded like the XLA conv);
@@ -89,7 +89,7 @@ def _verify_kernel(
         kt = jnp.transpose(l2(ks[t]))  # [D, H]
         qT.append(jnp.transpose(l2(qs[t]) * scale))
         kT.append(kt)
-        kbT.append(kt * beta_ref[0, t : t + 1, :].astype(f32))  # beta row [1, H]
+        kbT.append(kt * beta_ref[0, t : t + 1, :])  # beta row [1, H], f32
         dT.append(jnp.transpose(jnp.exp(g)))
     outs = [[None] * H for _ in range(T)]
     for h in range(H):

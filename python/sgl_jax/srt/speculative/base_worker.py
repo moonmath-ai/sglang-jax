@@ -411,11 +411,11 @@ class BaseSpecWorker:
         )
 
     def _commit_recurrent_state_after_verify(self, model_worker_batch, accept_length):
-        """Hybrid (KDA/GDN) targets: TARGET_VERIFY only recorded per-step recurrent states;
-        advance each request's running state by exactly its accepted length."""
+        """Hybrid KDA targets: TARGET_VERIFY only recorded per-step recurrent states (the
+        pool's verify scratch); advance each request's running state by its accepted length."""
         pools = self.target_worker.model_runner.memory_pools
         rsp = pools._pools.get("recurrent_state_pool")
-        if rsp is None:
+        if rsp is None or not rsp.spec_num_draft_tokens:
             return
         recurrent_indices = model_worker_batch.recurrent_indices
         assert recurrent_indices is not None, "hybrid target verify needs recurrent_indices"

@@ -500,7 +500,8 @@ class ModelRunnerKVCacheMixin:
 
         state_memory_per_rank = (sa.max_recurrent_state_size // dp_size) * per_req_state
         # Speculative verify scratch (KDA targets): per verify-batch row, the state after each
-        # draft token (see RecurrentStatePool); rows = max running requests + 1 per rank.
+        # draft token (see RecurrentStatePool); rows = max running requests + 1 per rank. Before
+        # max running requests is resolved, the recurrent state size (which caps it) bounds it.
         spec_tokens = self._spec_verify_tokens()
         if spec_tokens:
             rows_per_rank = (sa.max_running_requests or sa.max_recurrent_state_size) // dp_size + 1

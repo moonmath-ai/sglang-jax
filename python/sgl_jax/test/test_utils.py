@@ -128,7 +128,7 @@ def _local_or_hf(repo: str) -> str:
     if repo not in _LOCAL_MODEL_LOG_ONCE:
         _LOCAL_MODEL_LOG_ONCE.add(repo)
         print(
-            f"[test_utils] cache miss for {repo} under {cache}, falling back to HF download",
+            f"[test_utils] cache miss for {repo} under {cache}, " f"falling back to HF download",
             file=sys.stderr,
             flush=True,
         )
@@ -235,9 +235,9 @@ def fill_unspecified_parallelism(parallelism: Sequence[int], num_devices: int) -
     assert parallelism.count(-1) == 1, "At most one axis can be unspecified."
     unspecified_axis_idx = parallelism.index(-1)
     determined_val = num_devices / np.prod(parallelism) * -1
-    assert determined_val >= 1 and determined_val.is_integer, (
-        "Unspecified value unable to be determined with the given parallelism values"
-    )
+    assert (
+        determined_val >= 1 and determined_val.is_integer
+    ), "Unspecified value unable to be determined with the given parallelism values"
     parallelism[unspecified_axis_idx] = int(determined_val)
     return parallelism
 
