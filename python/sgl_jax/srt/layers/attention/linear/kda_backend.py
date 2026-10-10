@@ -30,18 +30,17 @@ _CONV_STREAM_SPEC = P("data", "tensor", None)
 
 
 def _conv_pool_to_streams(x):
-    """Local [B, K-1, 3, H, D] -> three [B, H*D, K-1]."""
+    """Local [B, K-1, 3, H, D] -> three [B, H*D, K-1]: one transpose of the whole tile, then
+    contiguous q / k / v chunks (cheaper than three strided slices, each transposed)."""
     B, km1 = x.shape[:2]
-    return tuple(jnp.swapaxes(x[:, :, s].reshape(B, km1, -1), 1, 2) for s in range(3))
+    return tuple(jnp.split(jnp.swapaxes(x.reshape(B, km1, -1), 1, 2), 3, axis=1))
 
 
 def _conv_streams_to_pool(streams, head_dim):
-    """Inverse of :func:`_conv_pool_to_streams`."""
-    *lead, hd, km1 = streams[0].shape
-    return jnp.stack(
-        [jnp.swapaxes(x, -1, -2).reshape(*lead, km1, hd // head_dim, head_dim) for x in streams],
-        axis=-3,
-    )
+    """Inverse of :func:`_conv_pool_to_streams`: concatenate, then one transpose."""
+    packed = jnp.concatenate(streams, axis=-2)  # [..., 3*H*D, K-1]
+    *lead, proj, km1 = packed.shape
+    return jnp.swapaxes(packed, -1, -2).reshape(*lead, km1, 3, proj // (3 * head_dim), head_dim)
 
 
 if TYPE_CHECKING:
