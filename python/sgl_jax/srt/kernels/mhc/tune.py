@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
 
@@ -19,20 +20,34 @@ class MHCPlatform:
     highest_collapse_blocks: tuple[int, ...]
     gates_blocks: tuple[int, ...]
     post_blocks: tuple[int, ...]
+    # Whether the Pallas post kernel replaces XLA once XLA's working set would spill.
+    post_pallas_when_xla_spills: bool = True
 
+
+_V6E = MHCPlatform(
+    name="TPU v6e",
+    device_markers=("v6e", "v6 lite", "tpu v6"),
+    lane_width=128,
+    vmem_bytes=32 * 1024 * 1024,
+    xla_vmem_bytes=96 * 1024 * 1024,
+    xla_vmem_reserve_bytes=64 * 1024,
+    collapse_blocks=(8, 16, 32, 64, 128, 256),
+    highest_collapse_blocks=(8, 16, 32, 64),
+    gates_blocks=(512, 1024, 2048),
+    post_blocks=(8, 16, 32, 64, 128, 256),
+)
 
 _PLATFORMS = (
-    MHCPlatform(
-        name="TPU v6e",
-        device_markers=("v6e", "v6 lite", "tpu v6"),
-        lane_width=128,
-        vmem_bytes=32 * 1024 * 1024,
-        xla_vmem_bytes=96 * 1024 * 1024,
-        xla_vmem_reserve_bytes=64 * 1024,
-        collapse_blocks=(8, 16, 32, 64, 128, 256),
-        highest_collapse_blocks=(8, 16, 32, 64),
-        gates_blocks=(512, 1024, 2048),
-        post_blocks=(8, 16, 32, 64, 128, 256),
+    _V6E,
+    # v7x: same 32 MiB scoped VMEM, so the same collapse / gate tiles (measured best at hc=4,
+    # D=4096: collapse 128, gate block immaterial). XLA's post fusion beats the Pallas post
+    # kernel at every size measured (16-4096 tokens; 203 vs 374 us at 4096), so it stays on XLA.
+    dataclasses.replace(
+        _V6E,
+        name="TPU v7x",
+        device_markers=("tpu7x", "v7x", "tpu v7"),
+        xla_vmem_bytes=64 * 1024 * 1024,
+        post_pallas_when_xla_spills=False,
     ),
     MHCPlatform(
         name="TPU v7x",
@@ -137,6 +152,8 @@ def select_post_backend(
     if pallas_block_tokens <= 0:
         raise ValueError("pallas_block_tokens must be positive")
     platform = _platform_parameters(device_kind)
+    if not platform.post_pallas_when_xla_spills:
+        return "xla"
     usable_vmem = platform.xla_vmem_bytes - platform.xla_vmem_reserve_bytes
     live_vmem = post_xla_live_vmem_bytes(
         tokens,

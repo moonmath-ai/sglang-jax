@@ -317,10 +317,10 @@ suites = {
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
         TestFile(
-            "python/sgl_jax/test/test_mhc_kernel.py",
+            "python/sgl_jax/test/test_glm5_next_hc.py",
             0.3,
             runner="pytest",
-            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4"},
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4", "PALLAS_INTERPRET": "1"},
         ),
         TestFile(
             "test/srt/kernels/dsa/test_compute_topk_pages.py",
