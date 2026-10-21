@@ -74,14 +74,15 @@ def _mla_backend(backend):
     return backend if isinstance(backend, MLAAttentionBackend) else None
 
 
-def _is_dsa(backend) -> bool:
-    return isinstance(_mla_backend(backend), DSASparseAttentionBackend)
+def _is_dsa_chain(backend) -> bool:
+    mla = _mla_backend(backend)
+    return isinstance(mla, DSASparseAttentionBackend) and mla.uses_spec_chain_layout()
 
 
 def can_use_chain_fused_round(spec_worker) -> bool:
-    """NEXTN topk=1 chains on DSA (KPool indexer) targets and drafts -- the only MLA-family
-    spec setup that exists today. A draft with a reduced (hot-token) vocabulary would emit
-    draft-vocab ids."""
+    """NEXTN topk=1 chains on DSA targets and drafts that verify in request layout (KPool
+    indexer); other DSA targets keep the generic draft/verify/draft-extend loop. A draft with
+    a reduced (hot-token) vocabulary would emit draft-vocab ids."""
     sa = spec_worker.server_args
     draft_runner = spec_worker.draft_worker.draft_model_runner
     return (
@@ -92,8 +93,8 @@ def can_use_chain_fused_round(spec_worker) -> bool:
         and spec_worker.speculative_num_draft_tokens == spec_worker.speculative_num_steps + 1
         and sa.dp_size == 1
         and not hasattr(spec_worker.draft_worker, "_workers")
-        and _is_dsa(spec_worker.target_worker.model_runner.attn_backend)
-        and _is_dsa(draft_runner.attn_backend)
+        and _is_dsa_chain(spec_worker.target_worker.model_runner.attn_backend)
+        and _is_dsa_chain(draft_runner.attn_backend)
     )
 
 

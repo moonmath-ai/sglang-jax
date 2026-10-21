@@ -226,6 +226,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         self.skip_offset = skip_offset
         self.full_slot = full_slot
 
+    def uses_spec_chain_layout(self) -> bool:
+        # The prefill-form verify path has no KPool indexer; KPool targets verify as chains.
+        return self.index_kpool > 1
+
     def tree_flatten(self):
         children, aux = super().tree_flatten()
         aux = {
@@ -322,11 +326,15 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # pages to reuse and fell to dense too (a 6-layer dense O(T²) block).
         # The kv cache write still happens inside the dense kernel via
         # input_output_aliases in the remaining (no-indexer) dense case.
-        # Speculative chains (TARGET_VERIFY / DRAFT_EXTEND) arrive in request layout, T causal
-        # queries per request (MLAAttentionBackend.get_eagle_forward_metadata), and take the
-        # decode path: top-k per query, then one multi-query sparse MLA pass per request.
+        # With a KPool indexer (uses_spec_chain_layout), speculative chains (TARGET_VERIFY /
+        # DRAFT_EXTEND) arrive in request layout, T causal queries per request
+        # (MLAAttentionBackend.get_eagle_forward_metadata), and take the decode path: top-k per
+        # query, then one multi-query sparse MLA pass per request. Other indexers keep the
+        # prefill-form verify below (or W7's decode form).
         mode = forward_batch.forward_mode
-        is_spec_chain = mode.is_target_verify() or mode.is_draft_extend()
+        is_spec_chain = (
+            mode.is_target_verify() or mode.is_draft_extend()
+        ) and self.uses_spec_chain_layout()
         is_decode = mode.is_decode() or is_spec_chain
         if is_full and q_idx is None:
             # No indexer projections on this layer: no top-k to compute or share.

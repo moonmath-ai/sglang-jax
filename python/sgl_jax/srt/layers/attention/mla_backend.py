@@ -302,8 +302,15 @@ class MLAAttentionBackend(AttentionBackend):
         sharding = NamedSharding(self.mesh, P(self.attention_data_partition_axis))
         return MLAAttentionMetadata(*device_array(tuple(arrays), sharding=sharding))
 
-    def get_eagle_forward_metadata(self, batch: ModelWorkerBatch, **kwargs):
-        """Metadata for draft prefill (EXTEND), TARGET_VERIFY and DRAFT_EXTEND."""
+    def uses_spec_chain_layout(self) -> bool:
+        """Whether TARGET_VERIFY / DRAFT_EXTEND run in request layout (the chain path above).
+
+        Off here: plain MLA keeps the prefill-form verify of :meth:`get_eagle_forward_metadata`.
+        """
+        return False
+
+    def _chain_eagle_forward_metadata(self, batch: ModelWorkerBatch, **kwargs):
+        """Request-layout metadata for draft prefill (EXTEND), TARGET_VERIFY and DRAFT_EXTEND."""
         if batch.forward_mode == ForwardMode.EXTEND:
             return self.get_forward_metadata(batch)
         return self._upload_metadata(self.eagle_forward_metadata_arrays(batch))
@@ -503,6 +510,8 @@ class MLAAttentionBackend(AttentionBackend):
         return self.get_eagle_forward_metadata(batch, **kwargs)
 
     def get_eagle_forward_metadata(self, batch, **kwargs):
+        if self.uses_spec_chain_layout():
+            return self._chain_eagle_forward_metadata(batch, **kwargs)
         # We don't support custom_mask in MLA yet, but for NEXTN it's just sequential draft tokens.
         import numpy as np
 

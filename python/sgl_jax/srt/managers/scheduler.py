@@ -202,6 +202,24 @@ def validate_dflash_request(req) -> str | None:
     return None
 
 
+def validate_chain_round_request(req) -> str | None:
+    """Per-request guard for the NEXTN chain fused round (see chain_fused_round.py).
+
+    The round never fills next_token_logprobs (accepting such a request crashed the scheduler
+    in add_logprob_return_values) and applies no grammar vocab mask (the grammar rejects the
+    unconstrained output mid-generation), so refuse those up front.
+    """
+    if req.return_logprob or req.return_output_logprob_only:
+        return "Speculative decoding (NEXTN chain round) does not support return_logprob yet."
+    sp = req.sampling_params
+    if any(getattr(sp, f, None) for f in ("json_schema", "regex", "ebnf", "structural_tag")):
+        return (
+            "Speculative decoding (NEXTN chain round) does not support constrained decoding "
+            "(response_format, regex, ebnf, or tool_choice='required') yet."
+        )
+    return None
+
+
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerProfilerMixin,
@@ -1277,26 +1295,12 @@ class Scheduler(
                 req.set_finish_with_abort(dflash_err)
                 self._add_request_to_queue(req)
                 return
-        elif not self.spec_algorithm.is_none() and (
-            req.return_logprob or req.return_output_logprob_only
-        ):
-            # The speculative workers never fill next_token_logprobs; accepting the request
-            # crashed the scheduler in add_logprob_return_values.
-            req.set_finish_with_abort("Speculative decoding does not support return_logprob yet.")
-            self._add_request_to_queue(req)
-            return
-        elif not self.spec_algorithm.is_none() and any(
-            getattr(req.sampling_params, f, None)
-            for f in ("json_schema", "regex", "ebnf", "structural_tag")
-        ):
-            # The speculative round applies no vocab mask, so the grammar rejects the
-            # unconstrained output mid-generation; refuse up front with a clear reason.
-            req.set_finish_with_abort(
-                "Speculative decoding does not support constrained decoding (response_format, "
-                "regex, ebnf, or tool_choice='required') yet."
-            )
-            self._add_request_to_queue(req)
-            return
+        elif getattr(getattr(self, "draft_worker", None), "_chain_fused_round", None) is not None:
+            chain_err = validate_chain_round_request(req)
+            if chain_err is not None:
+                req.set_finish_with_abort(chain_err)
+                self._add_request_to_queue(req)
+                return
 
         if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
             # By default, only return the logprobs for output tokens
